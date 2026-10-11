@@ -237,9 +237,20 @@ def canonical(code, decoder=None):
     for index, (name, operand) in enumerate(ops):
         if isinstance(operand, tuple) and operand[:1] == ('target_offset',):
             ops[index] = (name, ('target', position(operand[1])))
-    exceptions = tuple((position(entry.start), position(entry.end), position(entry.target),
-                        entry.depth, entry.lasti) for entry in dis.Bytecode(code).exception_entries
-                       if position(entry.start) != position(entry.end))
+    exceptions = []
+    for entry in dis.Bytecode(code).exception_entries:
+        region = (position(entry.start), position(entry.end), position(entry.target), entry.depth, entry.lasti)
+        if region[0] == region[1]:
+            continue
+        # Adjacent ranges with the same handler have exactly the same dispatch
+        # map as one range. Padding and removed runtime layers can split them.
+        # Never merge across a meaningful instruction or a different handler.
+        if exceptions and exceptions[-1][1] == region[0] and exceptions[-1][2:] == region[2:]:
+            previous = exceptions[-1]
+            exceptions[-1] = (previous[0], region[1], *region[2:])
+        else:
+            exceptions.append(region)
+    exceptions = tuple(exceptions)
     parameters = code.co_argcount + code.co_kwonlyargcount
     parameters += bool(code.co_flags & 4) + bool(code.co_flags & 8)
     # PyArmor return epilogues can leave a jump to a shared RETURN_VALUE

@@ -40,6 +40,14 @@ Parameters, public bindings, nonlocal cells, colliding names and ambiguous
 definitions are retained. This fixes generated nested helper names without
 relaxing comparison of their bodies or callers.
 
+Removing a recognized runtime exit/rethrow layer preserves its route into
+the compiler's StopIteration handler. The normalizer validates the complete
+rethrow, cleanup, and outer-handler chain before reconnecting it. Owned
+coroutine, generator and async-generator fixtures compare normal results,
+errors and causes before and after normalization, including real user handlers.
+Exception comparisons merge only adjacent ranges with identical dispatch;
+a missing covered call or a changed depth/lasti still fails comparison.
+
 A separate static verifier compares nested code units and keeps unsupported
 marker patterns as failures:
 

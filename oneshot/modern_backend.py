@@ -88,6 +88,57 @@ def restore_function_bindings(code: types.CodeType) -> types.CodeType:
                         co_cellvars=tuple(renames.get(name, name) for name in code.co_cellvars))
 
 
+def restore_stop_iteration_routes(code, instructions, entries, exits):
+    """Bypass a removed runtime rethrow layer, preserving the outer handler.
+
+    In protected generators/coroutines, the body's exception table targets
+    PyArmor's exit handler. Its COPY/POP_EXCEPT/RERAISE cleanup then enters the
+    compiler's STOPITERATION_ERROR handler. Dropping the first route loses
+    that compiler handler's coverage. Only this complete, recognized chain is
+    flattened; user handlers and unrecognized runtime layouts stay distinct.
+    """
+    if not code.co_flags & (32 | 128 | 512):
+        return entries
+    significant = [item for item in instructions
+                   if item.opname not in ('NOP', 'CACHE', 'EXTENDED_ARG', 'NOT_TAKEN')]
+    indices = {item.offset: index for index, item in enumerate(significant)}
+    routes = {}
+    expected = ('PUSH_EXC_INFO', 'LOAD_CONST', 'PUSH_NULL', 'LOAD_CONST', 'CALL',
+                'POP_TOP', 'RERAISE', 'COPY', 'POP_EXCEPT', 'RERAISE')
+    for head in exits & {entry.target for entry in entries}:
+        index = indices.get(head)
+        if index is None:
+            continue
+        handler = significant[index:index + len(expected)]
+        if len(handler) != len(expected) or tuple(item.opname for item in handler) != expected:
+            continue
+        marker = handler[1].argval
+        if (not isinstance(marker, str) or not marker.startswith(('__pyarmor_exit_', '__pyarmor_leave_'))
+                or handler[4].arg != 1 or handler[6].arg != 0
+                or handler[7].arg != 3 or handler[9].arg != 1):
+            continue
+        cleanup = handler[7].offset
+        if not any(entry.start <= head and entry.end == cleanup and entry.target == cleanup
+                   and entry.depth == 1 and entry.lasti for entry in entries):
+            continue
+        outer = []
+        for entry in entries:
+            if not (entry.start <= cleanup and entry.end >= handler[9].offset + 2
+                    and entry.depth == 0 and entry.lasti):
+                continue
+            target = indices.get(entry.target)
+            tail = significant[target:target + 2] if target is not None else []
+            if (len(tail) == 2 and tail[0].opname == 'CALL_INTRINSIC_1' and tail[0].arg == 3
+                    and tail[1].opname == 'RERAISE' and tail[1].arg == 1):
+                outer.append(entry)
+        targets = {(entry.target, entry.depth, entry.lasti) for entry in outer}
+        if len(targets) == 1:
+            routes[head] = next(iter(targets))
+    return [entry._replace(target=routes[entry.target][0], depth=routes[entry.target][1],
+                           lasti=routes[entry.target][2]) if entry.target in routes else entry
+            for entry in entries]
+
+
 def normalize_code(code: types.CodeType) -> types.CodeType:
     """Remove only identified PyArmor entry/exit plumbing; retain user handlers."""
     if sys.version_info[:2] != (3, 14):
@@ -176,7 +227,9 @@ def normalize_code(code: types.CodeType) -> types.CodeType:
     for instruction in instructions:
         if instruction.opname == 'JUMP_FORWARD' and instruction.argval in exits:
             bytecode[instruction.offset:instruction.offset + 2] = bytes((dis.opmap['RETURN_VALUE'], 0))
-    entries = [entry for entry in dis.Bytecode(code).exception_entries if entry.target not in exits]
+    entries = restore_stop_iteration_routes(code, instructions,
+                                           list(dis.Bytecode(code).exception_entries), exits)
+    entries = [entry for entry in entries if entry.target not in exits]
     # NOP unreachable cleanup blocks without moving any instruction addresses.
     # This keeps jump offsets and genuine exception-table regions intact.
     by_offset = {instruction.offset: index for index, instruction in enumerate(instructions)}

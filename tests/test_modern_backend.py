@@ -171,6 +171,106 @@ class ModernBackendTests(native.Python314Tests):
 
 class NormalizationTests(unittest.TestCase):
     @staticmethod
+    def exit_layer_fixture(source, *, valid_outer=True):
+        """Wrap owned bytecode in the observed runtime rethrow/cleanup shape."""
+        import dis
+        import types
+        class ExitMarker(str):
+            def __call__(self, context):
+                return None
+        module = compile(source, 'fixture.py', 'exec', dont_inherit=True)
+        code = next(value for value in module.co_consts if isinstance(value, types.CodeType))
+        ops = {item.offset: item for item in dis.get_instructions(code)}
+        entries = list(dis.Bytecode(code).exception_entries)
+        implicit = [entry for entry in entries if ops[entry.target].opname == 'CALL_INTRINSIC_1'
+                    and ops[entry.target].arg == 3]
+        if not implicit:
+            raise AssertionError('Fixture needs a compiler StopIteration handler')
+        head, marker = len(code.co_code), len(code.co_consts)
+        suffix = bytes((dis.opmap['PUSH_EXC_INFO'], 0, dis.opmap['LOAD_CONST'], marker,
+                        dis.opmap['PUSH_NULL'], 0, dis.opmap['LOAD_CONST'], marker + 1,
+                        dis.opmap['CALL'], 1)) + bytes(6) + bytes((
+                            dis.opmap['POP_TOP'], 0, dis.opmap['RERAISE'], 0,
+                            dis.opmap['COPY'], 3, dis.opmap['POP_EXCEPT'], 0,
+                            dis.opmap['RERAISE'], 1))
+        cleanup = head + len(suffix) - 6
+        rows = [entry._replace(target=head, depth=0, lasti=False) if entry in implicit else entry
+                for entry in entries]
+        row_type = type(implicit[0])
+        rows.extend((row_type(head, cleanup, cleanup, 1, True),
+                     row_type(cleanup, head + len(suffix), implicit[0].target, 0, valid_outer)))
+        table = b''.join(_varint(row.start // 2, marker=True) + _varint((row.end - row.start) // 2)
+                         + _varint(row.target // 2) + _varint((row.depth << 1) | row.lasti)
+                         for row in sorted(rows))
+        protected = code.replace(co_code=code.co_code + suffix, co_exceptiontable=table,
+                                 co_stacksize=max(8, code.co_stacksize + 4),
+                                 co_consts=code.co_consts + (ExitMarker('__pyarmor_exit_fixture__'), b'owned_context'))
+        return code, protected
+
+    @unittest.skipUnless(sys.version_info[:2] == (3, 14), 'Requires CPython 3.14')
+    def test_exit_layer_preserves_coroutine_generator_and_async_generator_errors(self):
+        import asyncio
+        import types
+        from bytecode_fidelity import compare
+        for source, kind in (('async def select(work):\n    return work()\n', 'coroutine'),
+                             ('def select(work):\n    yield work()\n', 'generator'),
+                             ('async def select(work):\n    yield work()\n', 'async_generator')):
+            plain, protected = self.exit_layer_fixture(source)
+            normalized = normalize_code(protected)
+            self.assertTrue(compare(normalized, plain)['all_units_match'])
+            def run(code, error):
+                def work():
+                    if error is not None:
+                        raise error('owned failure')
+                    return 7
+                instance = types.FunctionType(code, {})(work)
+                try:
+                    if kind == 'coroutine':
+                        # Drive directly so asyncio's Task cannot hide a
+                        # wrongly escaping StopIteration as a successful result.
+                        try:
+                            instance.send(None)
+                        except StopIteration as completed:
+                            return ('result', completed.value)
+                    elif kind == 'generator':
+                        return ('result', next(instance))
+                    else:
+                        return ('result', asyncio.run(anext(instance)))
+                except Exception as caught:
+                    return ('error', type(caught), str(caught), type(caught.__cause__))
+                finally:
+                    if kind != 'async_generator':
+                        instance.close()
+                    else:
+                        asyncio.run(instance.aclose())
+            for error in (None, ValueError, StopIteration, StopAsyncIteration):
+                with self.subTest(kind=kind, error=error):
+                    self.assertEqual(run(normalized, error), run(protected, error))
+                    self.assertEqual(run(normalized, error), run(plain, error))
+
+    @unittest.skipUnless(sys.version_info[:2] == (3, 14), 'Requires CPython 3.14')
+    def test_exit_layer_preserves_real_nested_exception_handlers(self):
+        import types
+        from bytecode_fidelity import compare
+        plain, protected = self.exit_layer_fixture('async def select(work):\n    try:\n        return work()\n'
+                                                  '    except ValueError:\n        return 8\n')
+        normalized = normalize_code(protected)
+        self.assertTrue(compare(normalized, plain)['all_units_match'])
+        for code in (plain, protected, normalized):
+            def work():
+                raise ValueError('handled by user')
+            coroutine = types.FunctionType(code, {})(work)
+            with self.assertRaises(StopIteration) as finished:
+                coroutine.send(None)
+            self.assertEqual(finished.exception.value, 8)
+
+    @unittest.skipUnless(sys.version_info[:2] == (3, 14), 'Requires CPython 3.14')
+    def test_exit_layer_does_not_invent_an_unrecognized_outer_route(self):
+        from bytecode_fidelity import compare
+        plain, protected = self.exit_layer_fixture('async def select(work):\n    return work()\n', valid_outer=False)
+        self.assertFalse(compare(protected, plain)['all_units_match'])
+
+    @staticmethod
     def binding_fixture(source, names):
         import types
         code = compile(source, 'fixture.py', 'exec', dont_inherit=True)

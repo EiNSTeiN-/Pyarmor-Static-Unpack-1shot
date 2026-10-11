@@ -8,7 +8,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'oneshot'))
 from bytecode_fidelity import compare, compile_source, constant
-from modern_backend import MarkerNormalizer
+from modern_backend import MarkerNormalizer, _varint
 
 
 @unittest.skipUnless(sys.version_info[:2] == (3, 14), 'Requires CPython 3.14')
@@ -79,6 +79,27 @@ class FidelityTests(unittest.TestCase):
         entry = next(entry for entry in report['entries'] if entry['unit'].endswith('/select#1'))
         self.assertFalse(entry['matched'])
         self.assertIn(entry['reason'], ('instructions', 'exception_table'))
+
+    def test_adjacent_identical_handler_ranges_have_identical_dispatch(self):
+        module = compile_source('async def select(work):\n    return work()\n', 'fixture.py')
+        function = next(value for value in module.co_consts if isinstance(value, types.CodeType))
+        entry = next(iter(dis.Bytecode(function).exception_entries))
+        split = next(item.offset for item in dis.get_instructions(function) if item.opname == 'CALL')
+        def table(rows):
+            return b''.join(_varint(row.start // 2, marker=True) + _varint((row.end - row.start) // 2)
+                            + _varint(row.target // 2) + _varint((row.depth << 1) | row.lasti)
+                            for row in rows)
+        divided = function.replace(co_exceptiontable=table([entry._replace(end=split), entry._replace(start=split)]))
+        self.assertTrue(compare(function, divided)['all_units_match'])
+        # One uncovered CALL changes exception behavior and must still fail.
+        call_end = next(item.offset for item in dis.get_instructions(function)
+                        if item.offset > split and item.opname != 'CACHE')
+        hole = function.replace(co_exceptiontable=table([entry._replace(end=split), entry._replace(start=call_end)]))
+        self.assertFalse(compare(function, hole)['all_units_match'])
+        # Handler depth/lasti remain significant even for adjacent ranges.
+        changed = function.replace(co_exceptiontable=table([entry._replace(end=split),
+                                    entry._replace(start=split, lasti=not entry.lasti)]))
+        self.assertFalse(compare(function, changed)['all_units_match'])
 
     def test_changed_docstring_is_rejected(self):
         self.assertFalse(self.check('def select():\n    "First."\n    return 2\n',
