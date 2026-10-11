@@ -30,8 +30,18 @@ runtime AES material and should remain private.
 
 The normalizer resolves closure cells by capture position, preserves genuine
 exception cleanup directly before an exit marker, and reconstructs future
-annotation expressions without extra quoting. A separate static verifier
-compares nested code units and keeps unsupported marker patterns as failures:
+annotation expressions without extra quoting.
+
+Numbered local function bindings are restored from their nested code object's
+original name when the binding is unambiguous. This metadata change keeps the
+instruction bytes and exception table intact; closure captures are resolved
+by position afterward. It also supports CPython 3.14 decorator applications.
+Parameters, public bindings, nonlocal cells, colliding names and ambiguous
+definitions are retained. This fixes generated nested helper names without
+relaxing comparison of their bodies or callers.
+
+A separate static verifier compares nested code units and keeps unsupported
+marker patterns as failures:
 
 ```bash
 .venv/bin/python oneshot/bytecode_fidelity.py reference.recovered.pyc candidate.py \

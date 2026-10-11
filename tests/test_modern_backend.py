@@ -13,7 +13,9 @@ import test_python314 as native
 BINARY, ROOT = native.BINARY, native.ROOT
 
 sys.path.insert(0, str(ROOT / 'oneshot'))
-from modern_backend import DeadTailNormalizer, FutureAnnotationNormalizer, MarkerNormalizer, _varint, normalize_code, recover
+from modern_backend import (DeadTailNormalizer, FutureAnnotationNormalizer,
+                            MarkerNormalizer, _varint, normalize_code, recover,
+                            restore_function_bindings)
 
 BACKEND = os.environ.get('PYARMOR_MODERN_BACKEND')
 
@@ -22,9 +24,11 @@ BACKEND = os.environ.get('PYARMOR_MODERN_BACKEND')
                      'Set PYARMOR_MODERN_BACKEND and use CPython 3.14')
 class ModernBackendTests(native.Python314Tests):
     def recover(self, source):
+        return self.recover_code(compile(source, 'fixture.py', 'exec', dont_inherit=True))
+
+    def recover_code(self, code):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'fixture.pyc'
-            code = compile(source, 'fixture.py', 'exec')
             path.write_bytes(importlib.util.MAGIC_NUMBER + bytes(12) + marshal.dumps(code))
             process = subprocess.run([str(BINARY), '--pyc', '--export-only', str(path)],
                                      capture_output=True, text=True, timeout=10)
@@ -47,6 +51,62 @@ class ModernBackendTests(native.Python314Tests):
             exec(code, original)
             exec(compile(source, 'recovered_fixture.py', 'exec'), reconstructed)
             return original, reconstructed
+
+    def test_named_nested_helpers_keep_names_and_closure_bindings(self):
+        import types
+        code = compile('def select(values):\n'
+                       '    def rank(value):\n        return value + len(values)\n'
+                       '    def count(value):\n        return rank(value) * 2\n'
+                       '    return count(values[0]), rank.__name__, count.__name__\n',
+                       'fixture.py', 'exec', dont_inherit=True)
+        outer = next(value for value in code.co_consts if isinstance(value, types.CodeType))
+        mapping = {'rank': '_var_var_8', 'count': '_var_var_9'}
+        changed = outer.replace(
+            co_varnames=tuple(mapping.get(name, name) for name in outer.co_varnames),
+            co_cellvars=tuple(mapping.get(name, name) for name in outer.co_cellvars))
+        code = code.replace(co_consts=tuple(changed if value is outer else value for value in code.co_consts))
+        original, reconstructed = self.recover_code(code)
+        for values in ([1], [3, 4], [-5, 0, 2]):
+            self.assertEqual(reconstructed['select'](values), original['select'](values))
+        self.assertIn('def rank(', self.last_generated)
+        self.assertIn('def count(', self.last_generated)
+        self.assertNotIn('_var_var_', self.last_generated)
+        from bytecode_fidelity import compare
+        self.assertTrue(compare(code, compile(self.last_generated, 'candidate.py', 'exec',
+                                             dont_inherit=True))['all_units_match'])
+
+    def test_decorated_nested_helper_keeps_original_name(self):
+        import types
+        code = compile('def select(value, decorator):\n'
+                       '    @decorator\n    def adjust(amount=2):\n        return value + amount\n'
+                       '    return adjust(), adjust.__name__\n', 'fixture.py', 'exec', dont_inherit=True)
+        outer = next(value for value in code.co_consts if isinstance(value, types.CodeType))
+        changed = outer.replace(co_varnames=tuple('_var_var_22' if name == 'adjust' else name
+                                                 for name in outer.co_varnames))
+        code = code.replace(co_consts=tuple(changed if value is outer else value for value in code.co_consts))
+        original, reconstructed = self.recover_code(code)
+        for value in (-2, 0, 5):
+            calls = []
+            def decorator(function):
+                calls.append(function.__name__)
+                return function
+            self.assertEqual(reconstructed['select'](value, decorator), original['select'](value, decorator))
+            self.assertEqual(calls, ['adjust', 'adjust'])
+        self.assertIn('def adjust(', self.last_generated)
+
+    def test_recursive_nested_helper_keeps_its_self_capture(self):
+        import types
+        code = compile('def select(value):\n    def factorial(number):\n'
+                       '        return 1 if number < 2 else number * factorial(number - 1)\n'
+                       '    return factorial(value)\n', 'fixture.py', 'exec', dont_inherit=True)
+        outer = next(value for value in code.co_consts if isinstance(value, types.CodeType))
+        changed = outer.replace(co_cellvars=tuple('_var_var_31' if name == 'factorial' else name
+                                                 for name in outer.co_cellvars))
+        code = code.replace(co_consts=tuple(changed if value is outer else value for value in code.co_consts))
+        original, reconstructed = self.recover_code(code)
+        for value in (0, 1, 2, 5, 8):
+            self.assertEqual(reconstructed['select'](value), original['select'](value))
+        self.assertIn('def factorial(', self.last_generated)
 
     def test_context_manager(self):
         # The optional backend supports the native backend's documented gap.
@@ -110,6 +170,81 @@ class ModernBackendTests(native.Python314Tests):
 
 
 class NormalizationTests(unittest.TestCase):
+    @staticmethod
+    def binding_fixture(source, names):
+        import types
+        code = compile(source, 'fixture.py', 'exec', dont_inherit=True)
+        outer = next(value for value in code.co_consts if isinstance(value, types.CodeType))
+        iterator = iter(names)
+        return outer.replace(co_consts=tuple(value.replace(co_name=next(iterator))
+                                            if isinstance(value, types.CodeType) else value
+                                            for value in outer.co_consts))
+
+    @unittest.skipUnless(sys.version_info[:2] == (3, 14), 'Requires CPython 3.14')
+    def test_function_binding_restoration_is_instruction_preserving_and_idempotent(self):
+        code = self.binding_fixture('def select():\n    def _var_var_1():\n        return 7\n'
+                                    '    return _var_var_1()\n', ['calculate'])
+        normalized = restore_function_bindings(code)
+        self.assertIn('calculate', normalized.co_varnames)
+        self.assertNotIn('_var_var_1', normalized.co_varnames)
+        self.assertEqual(code.co_code, normalized.co_code)
+        self.assertEqual(code.co_exceptiontable, normalized.co_exceptiontable)
+        self.assertEqual(restore_function_bindings(normalized), normalized)
+
+    @unittest.skipUnless(sys.version_info[:2] == (3, 14), 'Requires CPython 3.14')
+    def test_function_binding_restoration_preserves_parameters(self):
+        code = self.binding_fixture('def select(_var_var_1):\n'
+                                    '    def _var_var_1():\n        return 7\n'
+                                    '    return _var_var_1()\n', ['calculate'])
+        self.assertIs(restore_function_bindings(code), code)
+
+    @unittest.skipUnless(sys.version_info[:2] == (3, 14), 'Requires CPython 3.14')
+    def test_function_binding_restoration_avoids_local_and_global_collisions(self):
+        for statement in ('calculate = 3', 'print(calculate)'):
+            with self.subTest(statement=statement):
+                code = self.binding_fixture('def select():\n    ' + statement + '\n'
+                                            '    def _var_var_1():\n        return 7\n'
+                                            '    return _var_var_1()\n', ['calculate'])
+                self.assertIs(restore_function_bindings(code), code)
+
+    @unittest.skipUnless(sys.version_info[:2] == (3, 14), 'Requires CPython 3.14')
+    def test_function_binding_restoration_rejects_ambiguous_definitions(self):
+        code = self.binding_fixture('def select(flag):\n    if flag:\n'
+                                    '        def _var_var_1():\n            return 1\n'
+                                    '    else:\n        def _var_var_1():\n            return 2\n'
+                                    '    return _var_var_1()\n', ['first', 'second'])
+        self.assertIs(restore_function_bindings(code), code)
+        code = self.binding_fixture('def select():\n    def _var_var_1():\n        return 1\n'
+                                    '    def _var_var_2():\n        return 2\n'
+                                    '    return _var_var_1(), _var_var_2()\n', ['same', 'same'])
+        self.assertIs(restore_function_bindings(code), code)
+
+    @unittest.skipUnless(sys.version_info[:2] == (3, 14), 'Requires CPython 3.14')
+    def test_function_binding_restoration_preserves_nonlocal_and_public_bindings(self):
+        import types
+        code = compile('def outer():\n    _var_var_1 = None\n    def inner():\n'
+                       '        nonlocal _var_var_1\n        def _var_var_1():\n            return 7\n',
+                       'fixture.py', 'exec', dont_inherit=True)
+        outer = next(value for value in code.co_consts if isinstance(value, types.CodeType))
+        inner = next(value for value in outer.co_consts if isinstance(value, types.CodeType))
+        child = next(value for value in inner.co_consts if isinstance(value, types.CodeType))
+        inner = inner.replace(co_consts=tuple(child.replace(co_name='calculate') if value is child else value
+                                             for value in inner.co_consts))
+        self.assertIs(restore_function_bindings(inner), inner)
+        for source in ('def _var_var_1():\n    return 7\n',
+                       'class Public:\n    def _var_var_1():\n        return 7\n'):
+            public = compile(source, 'fixture.py', 'exec', dont_inherit=True)
+            def renamed(value):
+                if not isinstance(value, types.CodeType):
+                    return value
+                return value.replace(co_name='calculate' if value.co_name == '_var_var_1' else value.co_name,
+                                     co_consts=tuple(renamed(child) for child in value.co_consts))
+            public = renamed(public)
+            self.assertIs(restore_function_bindings(public), public)
+            for value in public.co_consts:
+                if isinstance(value, types.CodeType) and value.co_name == 'Public':
+                    self.assertIs(restore_function_bindings(value), value)
+
     def test_runtime_only_suites_remain_syntactically_valid(self):
         import ast
         source = 'class Result:\n    __assert_armored__ = "__pyarmor_assert_fixture__"\n'

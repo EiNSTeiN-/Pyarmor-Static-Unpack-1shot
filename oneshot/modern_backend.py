@@ -10,6 +10,7 @@ import ast
 import dis
 import importlib.util
 import json
+import keyword
 import marshal
 from pathlib import Path
 import subprocess
@@ -33,10 +34,65 @@ def _varint(value: int, marker: bool = False) -> bytes:
     return bytes(digits)
 
 
+def restore_function_bindings(code: types.CodeType) -> types.CodeType:
+    """Recover unambiguous local definition names without changing instructions.
+
+    PyArmor can rename a function's local binding while keeping the nested
+    code object's original name. The source backend takes its definition name
+    from that binding. Restore only numbered PyArmor locals, never parameters,
+    globals, nonlocal cells, class attributes, or conflicting names. Closure
+    captures are subsequently resolved by position in ``normalize_code``.
+    """
+    instructions = [item for item in dis.get_instructions(code)
+                    if item.opname not in ('NOP', 'CACHE', 'EXTENDED_ARG', 'NOT_TAKEN')]
+    definitions = {}
+    for index, item in enumerate(instructions[:-1]):
+        if (item.opname != 'LOAD_CONST' or not isinstance(item.argval, types.CodeType)
+                or instructions[index + 1].opname != 'MAKE_FUNCTION'):
+            continue
+        name = item.argval.co_name
+        if not name.isidentifier() or keyword.iskeyword(name) or name == '__annotate__':
+            continue
+        after = index + 2
+        while after < len(instructions) and instructions[after].opname == 'SET_FUNCTION_ATTRIBUTE':
+            after += 1
+        # In CPython 3.14 decorators use the function as CALL 0's implicit
+        # argument. Consecutive decorator applications retain this binding.
+        while (after < len(instructions) and instructions[after].opname == 'CALL'
+               and instructions[after].arg == 0):
+            after += 1
+        if after >= len(instructions):
+            continue
+        binding = instructions[after]
+        if (binding.opname not in ('STORE_FAST', 'STORE_DEREF')
+                or not isinstance(binding.argval, str)
+                or not binding.argval.startswith('_var_var_')):
+            continue
+        definitions.setdefault(binding.argval, set()).add(name)
+
+    parameter_count = code.co_argcount + code.co_kwonlyargcount
+    parameter_count += bool(code.co_flags & 4) + bool(code.co_flags & 8)
+    parameters = set(code.co_varnames[:parameter_count])
+    local_names = set(code.co_varnames) | set(code.co_cellvars)
+    occupied = local_names | set(code.co_freevars) | set(code.co_names)
+    candidates = {binding: next(iter(names)) for binding, names in definitions.items()
+                  if len(names) == 1 and binding in local_names
+                  and binding not in parameters and binding not in code.co_freevars}
+    counts = {name: sum(other == name for other in candidates.values())
+              for name in candidates.values()}
+    renames = {binding: name for binding, name in candidates.items()
+               if name not in occupied and counts[name] == 1}
+    if not renames:
+        return code
+    return code.replace(co_varnames=tuple(renames.get(name, name) for name in code.co_varnames),
+                        co_cellvars=tuple(renames.get(name, name) for name in code.co_cellvars))
+
+
 def normalize_code(code: types.CodeType) -> types.CodeType:
     """Remove only identified PyArmor entry/exit plumbing; retain user handlers."""
     if sys.version_info[:2] != (3, 14):
         raise ValueError('Modern source recovery currently requires CPython 3.14')
+    code = restore_function_bindings(code)
     instructions = list(dis.get_instructions(code))
     bytecode = bytearray(code.co_code)
     # A closure's cells are bound by tuple position, not by co_freevars text.
