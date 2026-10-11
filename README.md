@@ -47,6 +47,10 @@ coroutine, generator and async-generator fixtures compare normal results,
 errors and causes before and after normalization, including real user handlers.
 Exception comparisons merge only adjacent ranges with identical dispatch;
 a missing covered call or a changed depth/lasti still fails comparison.
+The standard initial `RESUME 0` is restored at its known entry slot when the
+native entry hook is removed. This makes ordinary frame lookup and
+zero-argument `super()` work in the recovered method; an inheritance fixture
+checks the constructor against its plain original code.
 
 A separate static verifier compares nested code units and keeps unsupported
 marker patterns as failures:

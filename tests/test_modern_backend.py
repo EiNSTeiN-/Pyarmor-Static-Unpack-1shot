@@ -170,6 +170,36 @@ class ModernBackendTests(native.Python314Tests):
 
 
 class NormalizationTests(unittest.TestCase):
+    @unittest.skipUnless(sys.version_info[:2] == (3, 14), 'Requires CPython 3.14')
+    def test_runtime_entry_restores_frame_visibility_for_zero_argument_super(self):
+        import builtins
+        import dis
+        import types
+        from bytecode_fidelity import compare
+        module = compile('class Child(Base):\n    def __init__(self, value):\n'
+                         '        super().__init__(value)\n', 'fixture.py', 'exec', dont_inherit=True)
+        body = next(value for value in module.co_consts if isinstance(value, types.CodeType))
+        method = next(value for value in body.co_consts if isinstance(value, types.CodeType))
+        resume = next(item for item in dis.get_instructions(method) if item.opname == 'RESUME')
+        marker = len(method.co_consts)
+        entry = bytes((dis.opmap['LOAD_CONST'], marker, dis.opmap['PUSH_NULL'], 0,
+                       dis.opmap['LOAD_CONST'], marker + 1, dis.opmap['CALL'], 1)) + bytes(6) + bytes((dis.opmap['POP_TOP'], 0))
+        protected = method.replace(co_code=method.co_code[:resume.offset] + bytes((dis.opmap['NOP'], 0))
+                                   + entry + method.co_code[resume.offset + 2:],
+                                   co_consts=method.co_consts + ('__pyarmor_enter_fixture__', b'owned_context'))
+        normalized = normalize_code(protected)
+        self.assertTrue(compare(normalized, method)['all_units_match'])
+        self.assertEqual(next(item for item in dis.get_instructions(normalized)
+                              if item.opname == 'RESUME').arg, 0)
+        class Base:
+            def __init__(self, value):
+                self.value = value
+        for child_method in (method, normalized):
+            class_code = body.replace(co_consts=tuple(child_method if value is method else value
+                                                     for value in body.co_consts))
+            cls = builtins.__build_class__(types.FunctionType(class_code, {}), 'Child', Base)
+            self.assertEqual(cls(7).value, 7)
+
     @staticmethod
     def exit_layer_fixture(source, *, valid_outer=True):
         """Wrap owned bytecode in the observed runtime rethrow/cleanup shape."""

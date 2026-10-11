@@ -146,6 +146,22 @@ def normalize_code(code: types.CodeType) -> types.CodeType:
     code = restore_function_bindings(code)
     instructions = list(dis.get_instructions(code))
     bytecode = bytearray(code.co_code)
+    # PyArmor's native entry hook replaces the ordinary initial RESUME.
+    # Without that hook, the frame can remain incomplete: zero-argument
+    # super() then consults the caller's frame. Restore only the known NOP
+    # slot after closure/cell setup and an optional generator-entry pair.
+    if any(item.opname == 'LOAD_CONST' and isinstance(item.argval, str)
+           and item.argval.startswith('__pyarmor_enter_') for item in instructions):
+        initial = [item for item in instructions if item.opname != 'EXTENDED_ARG']
+        index = 0
+        while index < len(initial) and initial[index].opname in ('COPY_FREE_VARS', 'MAKE_CELL'):
+            index += 1
+        if (index + 1 < len(initial) and initial[index].opname == 'RETURN_GENERATOR'
+                and initial[index + 1].opname == 'POP_TOP'):
+            index += 2
+        if index < len(initial) and initial[index].opname == 'NOP':
+            offset = initial[index].offset
+            bytecode[offset:offset + 2] = bytes((dis.opmap['RESUME'], 0))
     # A closure's cells are bound by tuple position, not by co_freevars text.
     # PyArmor can rename parent cells without renaming a nested code object's
     # metadata. Resolve the actual capture names before descending into it.
