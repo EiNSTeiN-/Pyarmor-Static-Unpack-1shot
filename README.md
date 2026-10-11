@@ -1,5 +1,44 @@
 # Pyarmor Static Unpack One-Shot Tool
 
+This fork adds CPython 3.14 recovery and an optional modern source backend.
+Native changes include borrowed local loads, small integer literals, fused
+stores, function defaults, cache-aware jumps, await expressions, formatted
+strings, and inline list/set/dict comprehensions. `--export-pyc` exports a
+standard decrypted object tree; `--export-only` avoids native AST reconstruction.
+
+For modern source recovery, build [EiNSTeiN-/pycdc-modern](https://github.com/EiNSTeiN-/pycdc-modern)
+and run this tool using CPython 3.14:
+
+```bash
+python3.14 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+cmake -S pycdc -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel 4
+.venv/bin/python oneshot/shot.py /path/to/input \
+  -r /path/to/pyarmor_runtime.so -e build/pyarmor-1shot \
+  --modern-backend /path/to/pycdc-modern/target/release/pycdc \
+  -o /path/to/output
+```
+
+The modern path removes identified runtime entry/exit plumbing, decodes mixed
+constants, preserves user exception handlers, and validates emitted source
+without importing it. Per-module `.recovery.json` reports distinguish syntax
+validation from structural warnings. `complete: true` means no structural issue
+was reported; it does **not** establish behavioral equivalence. Keep `.das`,
+`.recovered.pyc`, and `.modern.raw.py` for comparison. Sequence files contain
+runtime AES material and should remain private.
+
+Run the original-fixture regression tests with:
+
+```bash
+PYARMOR_MODERN_BACKEND=/path/to/pycdc-modern/target/release/pycdc \
+  .venv/bin/python -B -m unittest discover -s tests -v
+```
+
+The native backend's context-manager test is an expected failure; the optional
+modern backend covers that case. The fork includes no recovered third-party
+code, runtime binaries, keys, or protected test fixtures.
+
 [![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/Lil-House/Pyarmor-Static-Unpack-1shot/total)](https://github.com/Lil-House/Pyarmor-Static-Unpack-1shot/releases)
 [![GitHub Repo stars](https://img.shields.io/github/stars/Lil-House/Pyarmor-Static-Unpack-1shot?style=flat)](https://github.com/Lil-House/Pyarmor-Static-Unpack-1shot/stargazers)
 [![GitHub Release](https://img.shields.io/github/v/release/Lil-House/Pyarmor-Static-Unpack-1shot)](https://github.com/Lil-House/Pyarmor-Static-Unpack-1shot/releases)

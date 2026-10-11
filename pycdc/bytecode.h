@@ -30,6 +30,7 @@ int ByteToOpcode(int maj, int min, int opcode);
 void print_const(std::ostream& pyc_output, PycRef<PycObject> obj, PycModule* mod,
                  const char* parent_f_string_quote = nullptr, bool das_decrypt_print = false);
 void bc_next(PycBuffer& source, PycModule* mod, int& opcode, int& operand, int& pos);
+int bc_jump_base(PycModule* mod, int opcode, int next_pos);
 void bc_disasm(std::ostream& pyc_output, PycRef<PycCode> code, PycModule* mod,
                int indent, unsigned flags);
 void bc_exceptiontable(std::ostream& pyc_output, PycRef<PycCode> code,

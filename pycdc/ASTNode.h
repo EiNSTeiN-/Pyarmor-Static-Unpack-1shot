@@ -4,6 +4,7 @@
 #include "pyc_module.h"
 #include <list>
 #include <deque>
+#include <map>
 
 /* Similar interface to PycObject, so PycRef can work on it... *
  * However, this does *NOT* mean the two are interchangeable!  */
@@ -256,11 +257,17 @@ public:
     PycRef<ASTNode> code() const { return m_code; }
     const defarg_t& defargs() const { return m_defargs; }
     const defarg_t& kwdefargs() const { return m_kwdefargs; }
+    void setDefargs(defarg_t values) { m_defargs = std::move(values); }
+    void setKeywordDefault(const std::string& name, PycRef<ASTNode> value)
+        { m_named_kwdefaults[name] = std::move(value); }
+    const std::map<std::string, PycRef<ASTNode>>& keywordDefaults() const
+        { return m_named_kwdefaults; }
 
 private:
     PycRef<ASTNode> m_code;
     defarg_t m_defargs;
     defarg_t m_kwdefargs;
+    std::map<std::string, PycRef<ASTNode>> m_named_kwdefaults;
 };
 
 
@@ -644,10 +651,14 @@ class ASTComprehension : public ASTNode {
 public:
     typedef std::list<PycRef<ASTIterBlock>> generator_t;
 
-    ASTComprehension(PycRef<ASTNode> result)
-        : ASTNode(NODE_COMPREHENSION), m_result(std::move(result)) { }
+    ASTComprehension(PycRef<ASTNode> result, int kind = NODE_LIST,
+                     PycRef<ASTNode> key = nullptr)
+        : ASTNode(NODE_COMPREHENSION), m_result(std::move(result)),
+          m_kind(kind), m_key(std::move(key)) { }
 
     PycRef<ASTNode> result() const { return m_result; }
+    int kind() const { return m_kind; }
+    PycRef<ASTNode> key() const { return m_key; }
     generator_t generators() const { return m_generators; }
 
     void addGenerator(PycRef<ASTIterBlock> gen) {
@@ -656,6 +667,8 @@ public:
 
 private:
     PycRef<ASTNode> m_result;
+    int m_kind;
+    PycRef<ASTNode> m_key;
     generator_t m_generators;
 
 };

@@ -183,6 +183,7 @@ void PycModule::setVersion(unsigned int magic)
         m_unicode = true;
         break;
 
+    case MAGIC_3_14_ALPHA:
     case MAGIC_3_14:
         m_maj = 3;
         m_min = 14;

@@ -292,6 +292,24 @@ void print_const(std::ostream& pyc_output, PycRef<PycObject> obj, PycModule* mod
     }
 }
 
+int bc_jump_base(PycModule* mod, int opcode, int next_pos)
+{
+    // Relative jumps start after their inline caches, not after the opcode.
+    switch (opcode) {
+    case Pyc::FOR_ITER_A:
+    case Pyc::SEND_A:
+        return next_pos + (mod->verCompare(3, 12) >= 0 ? 2 : 0);
+    case Pyc::JUMP_BACKWARD_A:
+    case Pyc::POP_JUMP_IF_FALSE_A:
+    case Pyc::POP_JUMP_IF_TRUE_A:
+    case Pyc::POP_JUMP_IF_NONE_A:
+    case Pyc::POP_JUMP_IF_NOT_NONE_A:
+        return next_pos + (mod->verCompare(3, 13) >= 0 ? 2 : 0);
+    default:
+        return next_pos;
+    }
+}
+
 void bc_next(PycBuffer& source, PycModule* mod, int& opcode, int& operand, int& pos)
 {
     opcode = Pyc::ByteToOpcode(mod->majorVer(), mod->minorVer(), source.getByte());
@@ -431,6 +449,7 @@ void bc_disasm(std::ostream& pyc_output, PycRef<PycCode> code, PycModule* mod,
                 break;
             case Pyc::DELETE_FAST_A:
             case Pyc::LOAD_FAST_A:
+            case Pyc::LOAD_FAST_BORROW_A:
             case Pyc::STORE_FAST_A:
             case Pyc::LOAD_FAST_CHECK_A:
             case Pyc::LOAD_FAST_AND_CLEAR_A:
@@ -441,6 +460,7 @@ void bc_disasm(std::ostream& pyc_output, PycRef<PycCode> code, PycModule* mod,
                 }
                 break;
             case Pyc::LOAD_FAST_LOAD_FAST_A:
+            case Pyc::LOAD_FAST_BORROW_LOAD_FAST_BORROW_A:
             case Pyc::STORE_FAST_LOAD_FAST_A:
             case Pyc::STORE_FAST_STORE_FAST_A:
                 try {
@@ -488,14 +508,11 @@ void bc_disasm(std::ostream& pyc_output, PycRef<PycCode> code, PycModule* mod,
             case Pyc::INSTRUMENTED_POP_JUMP_IF_FALSE_A:
             case Pyc::INSTRUMENTED_POP_JUMP_IF_TRUE_A:
                 {
-                    /* TODO: Fix offset based on CACHE instructions.
-                       Offset is relative to next non-CACHE instruction
-                       and thus will be printed lower than actual value.
-                       See TODO @ END_FOR ASTree.cpp */
+                    // Relative targets start after the opcode's inline caches.
                     int offs = operand;
                     if (mod->verCompare(3, 10) >= 0)
                         offs *= sizeof(uint16_t); // BPO-27129
-                    formatted_print(pyc_output, "%d (to %d)", operand, pos+offs);
+                    formatted_print(pyc_output, "%d (to %d)", operand, bc_jump_base(mod, opcode, pos)+offs);
                 }
                 break;
             case Pyc::JUMP_BACKWARD_NO_INTERRUPT_A:
@@ -508,7 +525,7 @@ void bc_disasm(std::ostream& pyc_output, PycRef<PycCode> code, PycModule* mod,
                 {
                     // BACKWARD jumps were only introduced in Python 3.11
                     int offs = operand * sizeof(uint16_t); // BPO-27129
-                    formatted_print(pyc_output, "%d (to %d)", operand, pos-offs);
+                    formatted_print(pyc_output, "%d (to %d)", operand, bc_jump_base(mod, opcode, pos)-offs);
                 }
                 break;
             case Pyc::POP_JUMP_IF_FALSE_A:
@@ -520,7 +537,7 @@ void bc_disasm(std::ostream& pyc_output, PycRef<PycCode> code, PycModule* mod,
                 if (mod->verCompare(3, 12) >= 0) {
                     // These are now relative as well
                     int offs = operand * sizeof(uint16_t);
-                    formatted_print(pyc_output, "%d (to %d)", operand, pos+offs);
+                    formatted_print(pyc_output, "%d (to %d)", operand, bc_jump_base(mod, opcode, pos)+offs);
                 } else if (mod->verCompare(3, 10) >= 0) {
                     // BPO-27129
                     formatted_print(pyc_output, "%d (to %d)", operand,
@@ -543,7 +560,9 @@ void bc_disasm(std::ostream& pyc_output, PycRef<PycCode> code, PycModule* mod,
                 }
                 break;
             case Pyc::BINARY_OP_A:
-                if (static_cast<size_t>(operand) < binop_strings_len)
+                if (mod->verCompare(3, 14) >= 0 && operand == 26)
+                    formatted_print(pyc_output, "%d ([])", operand);
+                else if (static_cast<size_t>(operand) < binop_strings_len)
                     formatted_print(pyc_output, "%d (%s)", operand, binop_strings[operand]);
                 else
                     formatted_print(pyc_output, "%d (UNKNOWN)", operand);

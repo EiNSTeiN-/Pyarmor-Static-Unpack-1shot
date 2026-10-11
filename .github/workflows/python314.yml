@@ -1,0 +1,33 @@
+name: Python 3.14 source recovery regressions
+on:
+  push:
+    branches: [main, python-314-decompilation]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  roundtrip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: unpacker
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: EiNSTeiN-/pycdc-modern
+          ref: 1f497faf2cfb935bc1be0b8b26ccf2367be7ae08
+          path: modern
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.14'
+      - run: python -m pip install -r unpacker/requirements.txt
+      - run: cmake -S unpacker/pycdc -B unpacker/build -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build unpacker/build --parallel 4
+      - run: cargo build --manifest-path modern/Cargo.toml --locked --bin pycdc
+      - run: python -B -m unittest discover -s tests -v
+        working-directory: unpacker
+        env:
+          PYARMOR_MODERN_BACKEND: ${{ github.workspace }}/modern/target/debug/pycdc

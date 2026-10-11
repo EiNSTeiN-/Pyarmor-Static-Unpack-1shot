@@ -22,8 +22,9 @@
 #undef main
 
 #include "ASTree.h"
+#include "pyc_export.h"
 
-const char* VERSION = "v0.4.1";
+const char* VERSION = "v0.4.2-einstein.1";
 
 bool unstableTryBlocksEnabled = false;
 
@@ -95,6 +96,9 @@ int main(int argc, char* argv[])
     unsigned disasm_flags = 0;
     bool unitbuf = false;
     bool banner = true;
+    bool ordinary_pyc = false;
+    bool write_pyc = false;
+    bool export_only = false;
     std::ofstream dc_out_file;
     std::ofstream das_out_file;
 
@@ -109,6 +113,9 @@ int main(int argc, char* argv[])
             fputs("Options:\n", stderr);
             fputs("  --pycode-extra Show extra fields in PyCode object dumps\n", stderr);
             fputs("  --show-caches  Don't suppress CACHE instructions in Python 3.11+ disassembly\n", stderr);
+            fputs("  --pyc          Read an ordinary .pyc file (useful for regression tests)\n", stderr);
+            fputs("  --export-pyc   Export decrypted objects as .recovered.pyc (static analysis only)\n", stderr);
+            fputs("  --export-only  Export bytecode and disassembly without native source reconstruction\n", stderr);
             fputs("  --unitbuf      Set output streams to be unbuffered\n", stderr);
             fputs("  --no-banner    Don't output banner\n", stderr);
             fputs("  --version      Show version information and then exit\n", stderr);
@@ -117,6 +124,13 @@ int main(int argc, char* argv[])
         } else if (strcmp(argv[arg], "--version") == 0 || strcmp(argv[arg], "-v") == 0) {
             puts(VERSION);
             return 0;
+        } else if (strcmp(argv[arg], "--pyc") == 0) {
+            ordinary_pyc = true;
+        } else if (strcmp(argv[arg], "--export-pyc") == 0) {
+            write_pyc = true;
+        } else if (strcmp(argv[arg], "--export-only") == 0) {
+            write_pyc = true;
+            export_only = true;
         } else if (strcmp(argv[arg], "--unitbuf") == 0) {
             unitbuf = true;
         } else if (strcmp(argv[arg], "--no-banner") == 0) {
@@ -197,7 +211,10 @@ int main(int argc, char* argv[])
 
     PycModule mod;
     try {
-        mod.loadFromOneshotSequenceFile(infile);
+        if (ordinary_pyc)
+            mod.loadFromFile(infile);
+        else
+            mod.loadFromOneshotSequenceFile(infile);
     } catch (std::exception &ex) {
         fprintf(stderr, "Error disassembling %s: %s\n", infile, ex.what());
         return 1;
@@ -206,6 +223,14 @@ int main(int argc, char* argv[])
     if (!mod.isValid()) {
         fprintf(stderr, "Could not load file %s\n", infile);
         return 1;
+    }
+    if (write_pyc) {
+        try {
+            export_pyc(mod, prefix_name + ".recovered.pyc");
+        } catch (const std::exception& ex) {
+            fprintf(stderr, "Error exporting decrypted bytecode: %s\n", ex.what());
+            return 1;
+        }
     }
 
     const char* dispname = strrchr(infile, PATHSEP);
@@ -252,6 +277,9 @@ int main(int argc, char* argv[])
 
     das_out_file.flush();
     das_out_file.close();
+
+    if (export_only)
+        return 0;
 
     banner && formatted_print(
         dc_out_file,

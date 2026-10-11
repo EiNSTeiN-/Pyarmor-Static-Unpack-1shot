@@ -61,6 +61,14 @@ public:
         return m_ptr == -1;
     }
 
+    int size() const { return m_ptr + 1; }
+
+    void setTop(int depth, PycRef<ASTNode> node)
+    {
+        if (depth > 0 && depth <= size())
+            m_stack[m_ptr + 1 - depth] = std::move(node);
+    }
+
 private:
     std::vector<PycRef<ASTNode>> m_stack;
     int m_ptr;

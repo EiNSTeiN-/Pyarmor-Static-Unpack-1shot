@@ -6,7 +6,7 @@ import asyncio
 import traceback
 import platform
 import locale
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set, Tuple, Optional
 import sys
 
 try:
@@ -28,7 +28,7 @@ from runtime import RuntimeInfo
 from util import dword, bytes_sub
 
 
-__version__ = "0.4.1"
+__version__ = "0.4.2-einstein.1"
 
 
 # Initialize colorama
@@ -88,10 +88,13 @@ async def run_pycdc_async(
     unhide_all_noisy_logs: bool = False,
     unhide_unsupported_opcode_errors: bool = False,
     unhide_stack_warnings: bool = False,
+    modern_backend: Optional[str] = None,
 ):
     logger = logging.getLogger("shot")
     try:
         options = []
+        if modern_backend:
+            options.append('--export-only')
         if unit_buf:
             options.append("--unitbuf")
         if no_banner:
@@ -126,6 +129,7 @@ async def run_pycdc_async(
                     unhide_all_noisy_logs=unhide_all_noisy_logs,
                     unhide_unsupported_opcode_errors=unhide_unsupported_opcode_errors,
                     unhide_stack_warnings=unhide_stack_warnings,
+                    modern_backend=modern_backend,
                 )
                 # do not log anything because it will be logged in the retried call
                 return
@@ -160,6 +164,14 @@ async def run_pycdc_async(
             logger.warning(
                 f"{Fore.YELLOW}PYCDC returned 0x{process.returncode:x} ({path_for_log}){Style.RESET_ALL}"
             )
+        elif modern_backend:
+            from pathlib import Path
+            from modern_backend import recover
+            result = await asyncio.to_thread(recover, Path(seq_file_path), Path(modern_backend))
+            if result.get('error'):
+                logger.error('Modern source recovery failed for %s: %s', path_for_log, result['error'])
+            elif not result.get('complete'):
+                logger.warning('Source emitted for %s; structural issues remain (see .recovery.json)', path_for_log)
 
     except Exception as e:
         error_details = traceback.format_exc()
@@ -334,6 +346,7 @@ async def decrypt_process_async(
                     unhide_all_noisy_logs=args.unhide_all_noisy_logs,
                     unhide_unsupported_opcode_errors=args.unhide_unsupported_opcode_errors,
                     unhide_stack_warnings=args.unhide_stack_warnings,
+                    modern_backend=args.modern_backend,
                 )
 
             except Exception as e:
@@ -447,6 +460,10 @@ def parse_args():
         action="store_true",
     )
     parser.add_argument(
+        '--modern-backend',
+        help='Path to an external pycdc-compatible backend. Requires running shot.py with CPython 3.14; emits validation reports.',
+    )
+    parser.add_argument(
         "--export-raw-data",
         help="Save data found in source files as-is. For debugging or manual analysis purposes.",
         action="store_true",
@@ -486,6 +503,11 @@ def main():
         return
 
     args = parse_args()
+    if args.modern_backend:
+        if sys.version_info[:2] != (3, 14):
+            raise SystemExit('--modern-backend currently requires CPython 3.14')
+        if not os.path.isfile(args.modern_backend) or not os.access(args.modern_backend, os.X_OK):
+            raise SystemExit('--modern-backend must name an executable file')
     logging.basicConfig(
         level=logging.INFO,
         format="%(levelname)-8s %(asctime)-28s %(message)s",
@@ -512,7 +534,7 @@ def main():
 
     if args.runtime:
         specified_runtime = RuntimeInfo(args.runtime)
-        print(specified_runtime)
+        logger.info('Using runtime %s (serial %s)', args.runtime, specified_runtime.serial_number)
         runtimes = {specified_runtime.serial_number: {specified_runtime}}
     else:
         specified_runtime = None
