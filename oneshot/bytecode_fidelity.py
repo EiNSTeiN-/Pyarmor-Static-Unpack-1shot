@@ -1,0 +1,260 @@
+"""Fail-closed, static comparisons of CPython 3.14 code objects.
+
+This is a stricter check than source compilation or counting functions. It
+does not execute either program. A mismatch stays a mismatch; unsupported
+PyArmor expression patterns are reported and never treated as equivalent.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+from bisect import bisect_left
+from collections import Counter
+from dataclasses import dataclass
+import dis
+import hashlib
+import importlib.util
+import json
+import marshal
+from pathlib import Path
+import sys
+import types
+import warnings
+
+try:
+    from .modern_backend import MarkerNormalizer, normalize_code
+except ImportError:
+    from modern_backend import MarkerNormalizer, normalize_code
+
+
+PADDING = frozenset(('NOP', 'CACHE', 'EXTENDED_ARG', 'NOT_TAKEN', 'RESUME'))
+FUSED = {
+    'LOAD_FAST_LOAD_FAST': ('LOAD_FAST', 'LOAD_FAST'),
+    'LOAD_FAST_BORROW_LOAD_FAST_BORROW': ('LOAD_FAST', 'LOAD_FAST'),
+    'STORE_FAST_LOAD_FAST': ('STORE_FAST', 'LOAD_FAST'),
+    'STORE_FAST_STORE_FAST': ('STORE_FAST', 'STORE_FAST'),
+}
+
+
+def compile_source(source, filename):
+    """The candidate must not inherit this verifier's future-annotations flag."""
+    return compile(source, filename, 'exec', dont_inherit=True)
+
+
+def constant(value):
+    """Compare literal values and types, not their constant-pool indexes."""
+    if isinstance(value, types.CodeType):
+        return ('code', value.co_name)
+    if isinstance(value, (tuple, frozenset)):
+        values = [constant(item) for item in value]
+        if isinstance(value, frozenset):
+            values.sort(key=repr)
+        return (type(value).__name__, tuple(values))
+    if isinstance(value, bytes):
+        # Avoid copying potentially confidential opaque payloads into reports.
+        return ('bytes', len(value), hashlib.sha256(value).hexdigest())
+    if isinstance(value, (str, int, float, complex, bool)) or value is None:
+        return (type(value).__name__, repr(value))
+    return (type(value).__name__, repr(value))
+
+
+def local_operand(code, index):
+    """Alpha-rename internal slots while preserving keyword parameter names."""
+    name = code._varname_from_oparg(index)
+    locals_ = [value for value in code.co_varnames if value != '__assert_armored__']
+    parameters = code.co_argcount + code.co_kwonlyargcount
+    parameters += bool(code.co_flags & 4) + bool(code.co_flags & 8)
+    if name in code.co_varnames[:parameters]:
+        return ('parameter', name)
+    if name in locals_:
+        return ('local', locals_.index(name))
+    cells = [value for value in code.co_cellvars if value not in code.co_varnames]
+    if name in cells:
+        return ('cell', cells.index(name))
+    if name in code.co_freevars:
+        return ('free', code.co_freevars.index(name))
+    return ('unresolved_slot', index)
+
+
+@dataclass(frozen=True)
+class CanonicalCode:
+    signature: tuple
+    instructions: tuple
+    exceptions: tuple
+    unresolved: tuple
+
+
+def canonical(code, decoder=None):
+    """Apply an explicit, narrow whitelist; keep control flow and handlers."""
+    original = [item for item in dis.get_instructions(code) if item.opname not in PADDING]
+    removed, replacements, unresolved = set(), {}, []
+    for index, item in enumerate(original):
+        if (item.opname == 'LOAD_CONST' and isinstance(item.argval, str)
+                and item.argval.startswith('__pyarmor_assert_')
+                and index + 1 < len(original)
+                and original[index + 1].opname == 'STORE_FAST'
+                and original[index + 1].argval == '__assert_armored__'):
+            removed.update((index, index + 1))
+            continue
+        is_assert = ((item.opname == 'LOAD_CONST' and isinstance(item.argval, str)
+                      and item.argval.startswith('__pyarmor_assert_'))
+                     or (item.opname in ('LOAD_FAST', 'LOAD_FAST_BORROW')
+                         and item.argval == '__assert_armored__'))
+        if not is_assert:
+            continue
+        # Literal-load form: assert_callable, NULL, encrypted literal, CALL 1.
+        tail = original[index + 1:index + 4]
+        if (decoder is not None and len(tail) == 3
+                and [value.opname for value in tail] == ['PUSH_NULL', 'LOAD_CONST', 'CALL']
+                and tail[2].arg == 1 and isinstance(tail[1].argval, bytes)):
+            try:
+                value = decoder.decode(ast.Constant(tail[1].argval))
+                if not isinstance(value, ast.Constant):
+                    raise ValueError('Non-scalar marker requires a separate lowering rule')
+                replacements[index] = ('LOAD_CONST', constant(value.value))
+                removed.update(range(index + 1, index + 4))
+                continue
+            except (ValueError, SyntaxError, TypeError):
+                pass
+        unresolved.append(item.offset)
+
+    ops, offsets = [], []
+    for index, item in enumerate(original):
+        if index in removed:
+            continue
+        if index in replacements:
+            offsets.append(item.offset)
+            ops.append(replacements[index])
+            continue
+        name, arg = item.opname, item.arg
+        if name in FUSED:
+            for opname, slot in zip(FUSED[name], (arg >> 4, arg & 15)):
+                offsets.append(item.offset)
+                ops.append((opname, local_operand(code, slot)))
+            continue
+        offsets.append(item.offset)
+        if name == 'LOAD_FAST_BORROW':
+            name = 'LOAD_FAST'
+        if name == 'LOAD_SMALL_INT':
+            name, operand = 'LOAD_CONST', constant(arg)
+        elif name == 'LOAD_CONST':
+            operand = constant(item.argval)
+        elif name in ('LOAD_FAST', 'LOAD_FAST_CHECK', 'LOAD_FAST_AND_CLEAR', 'STORE_FAST',
+                      'DELETE_FAST', 'LOAD_DEREF', 'STORE_DEREF', 'DELETE_DEREF',
+                      'LOAD_CLOSURE', 'MAKE_CELL'):
+            operand = local_operand(code, arg)
+        elif item.opcode in dis.hasjump:
+            # Direction is determined by the target; NO_INTERRUPT stays distinct.
+            if name in ('JUMP_FORWARD', 'JUMP_BACKWARD'):
+                name = 'JUMP'
+            operand = ('target_offset', item.argval)
+        elif name == 'LOAD_GLOBAL':
+            operand = (item.argval, arg & 1)
+        elif name == 'LOAD_ATTR':
+            operand = (item.argval, arg & 1)
+        elif item.opcode in dis.hasname:
+            operand = item.argval
+        else:
+            operand = arg
+        ops.append((name, operand))
+
+    def position(offset):
+        return bisect_left(offsets, offset)
+
+    for index, (name, operand) in enumerate(ops):
+        if isinstance(operand, tuple) and operand[:1] == ('target_offset',):
+            ops[index] = (name, ('target', position(operand[1])))
+    exceptions = tuple((position(entry.start), position(entry.end), position(entry.target),
+                        entry.depth, entry.lasti) for entry in dis.Bytecode(code).exception_entries
+                       if position(entry.start) != position(entry.end))
+    parameters = code.co_argcount + code.co_kwonlyargcount
+    parameters += bool(code.co_flags & 4) + bool(code.co_flags & 8)
+    # PyArmor return epilogues can leave a jump to a shared RETURN_VALUE
+    # where the ordinary compiler emits RETURN_VALUE directly. It is the
+    # same terminator only when the destination contains no intervening work.
+    for index, (name, operand) in enumerate(ops):
+        if name == 'JUMP' and operand[0] == 'target':
+            target = operand[1]
+            if target < len(ops) and ops[target][0] == 'RETURN_VALUE':
+                ops[index] = ('RETURN_VALUE', None)
+    docstring = constant(code.co_consts[0]) if code.co_flags & 67108864 else None
+    signature = (code.co_argcount, code.co_posonlyargcount, code.co_kwonlyargcount,
+                 code.co_flags, tuple(code.co_varnames[:parameters]),
+                 len(code.co_freevars), len(code.co_cellvars), docstring)
+    return CanonicalCode(signature, tuple(ops), exceptions, tuple(unresolved))
+
+
+def units(code, path='<module>'):
+    """Use names and occurrence numbers to match separately compiled units."""
+    yield path, code
+    counts = Counter()
+    for value in code.co_consts:
+        if isinstance(value, types.CodeType):
+            counts[value.co_name] += 1
+            yield from units(value, f'{path}/{value.co_name}#{counts[value.co_name]}')
+
+
+def compare(reference, candidate, decoder=None):
+    expected = dict(units(normalize_code(reference)))
+    actual = dict(units(normalize_code(candidate)))
+    entries = []
+    for path in sorted(expected.keys() | actual.keys()):
+        entry = {'unit': path, 'matched': False}
+        if path not in expected or path not in actual:
+            entry['reason'] = 'missing_reference_unit' if path not in expected else 'missing_source_unit'
+        else:
+            left, right = canonical(expected[path], decoder), canonical(actual[path])
+            if left.unresolved or right.unresolved:
+                entry.update(reason='unsupported_marker_pattern', unresolved_marker_count=len(left.unresolved) + len(right.unresolved))
+            elif left.signature != right.signature:
+                entry.update(reason='signature', reference=left.signature, candidate=right.signature)
+            elif left.instructions != right.instructions:
+                first = next((index for index, (a, b) in enumerate(zip(left.instructions, right.instructions))
+                              if a != b), min(len(left.instructions), len(right.instructions)))
+                entry.update(reason='instructions', first_difference=first,
+                             reference=left.instructions[max(0, first - 2):first + 3],
+                             candidate=right.instructions[max(0, first - 2):first + 3],
+                             reference_instruction_count=len(left.instructions),
+                             candidate_instruction_count=len(right.instructions))
+            elif left.exceptions != right.exceptions:
+                entry.update(reason='exception_table', reference=left.exceptions, candidate=right.exceptions)
+            else:
+                entry.update(matched=True, reason='normalized_bytecode_match')
+        entries.append(entry)
+    return {'reference_units': len(expected), 'source_units': len(actual),
+            'matched_units': sum(entry['matched'] for entry in entries),
+            'all_units_match': all(entry['matched'] for entry in entries),
+            'behavioral_equivalence_verified': False, 'entries': entries}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('reference', type=Path)
+    parser.add_argument('source', type=Path)
+    parser.add_argument('--sequence', type=Path)
+    parser.add_argument('--report', type=Path, required=True)
+    args = parser.parse_args()
+    if sys.version_info[:2] != (3, 14):
+        parser.error('Run with CPython 3.14')
+    data = args.reference.read_bytes()
+    if data[:4] != importlib.util.MAGIC_NUMBER:
+        parser.error('Reference magic does not match this interpreter')
+    reference = marshal.loads(data[16:])
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', SyntaxWarning)
+        candidate = compile_source(args.source.read_text(), str(args.source))
+    decoder = None
+    if args.sequence:
+        header = args.sequence.read_bytes()[:34]
+        if len(header) != 34 or header[0] != 0xa1 or header[17] != 0xa2:
+            parser.error('Invalid sequence metadata')
+        decoder = MarkerNormalizer(header[1:17], header[18:30])
+    report = compare(reference, candidate, decoder)
+    args.report.write_text(json.dumps(report, indent=2) + '\n')
+    print(json.dumps({key: value for key, value in report.items() if key != 'entries'}))
+    return 0 if report['all_units_match'] else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

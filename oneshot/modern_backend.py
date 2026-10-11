@@ -39,8 +39,36 @@ def normalize_code(code: types.CodeType) -> types.CodeType:
         raise ValueError('Modern source recovery currently requires CPython 3.14')
     instructions = list(dis.get_instructions(code))
     bytecode = bytearray(code.co_code)
-    constants = tuple(normalize_code(value) if isinstance(value, types.CodeType)
-                      else value for value in code.co_consts)
+    # A closure's cells are bound by tuple position, not by co_freevars text.
+    # PyArmor can rename parent cells without renaming a nested code object's
+    # metadata. Resolve the actual capture names before descending into it.
+    significant = [item for item in instructions
+                   if item.opname not in ('NOP', 'CACHE', 'EXTENDED_ARG', 'NOT_TAKEN')]
+    captures = {}
+    for index, item in enumerate(significant):
+        if item.opname != 'LOAD_CONST' or not isinstance(item.argval, types.CodeType):
+            continue
+        child = item.argval
+        if not child.co_freevars or index < 1:
+            continue
+        tail = significant[index + 1:index + 3]
+        if [next_item.opname for next_item in tail] != ['MAKE_FUNCTION', 'SET_FUNCTION_ATTRIBUTE']:
+            continue
+        if tail[1].arg != 8 or significant[index - 1].opname != 'BUILD_TUPLE':
+            continue
+        count = significant[index - 1].arg
+        loads = significant[index - count - 1:index - 1]
+        if (count != len(child.co_freevars) or len(loads) != count
+                or any(load.opname not in ('LOAD_FAST', 'LOAD_FAST_BORROW', 'LOAD_DEREF', 'LOAD_CLOSURE')
+                       or not isinstance(load.argval, str) for load in loads)):
+            continue
+        names = tuple(load.argval for load in loads)
+        if item.arg in captures and captures[item.arg] != names:
+            raise ValueError('One code object has inconsistent closure capture names')
+        captures[item.arg] = names
+    constants = tuple(normalize_code(value.replace(co_freevars=captures.get(index, value.co_freevars)))
+                      if isinstance(value, types.CodeType) else value
+                      for index, value in enumerate(code.co_consts))
     exits = set()
     forced_jumps = {}
     for index, instruction in enumerate(instructions):
@@ -73,8 +101,16 @@ def normalize_code(code: types.CodeType) -> types.CodeType:
             continue
         name = instruction.argval
         if name.startswith(('__pyarmor_exit_', '__pyarmor_leave_')):
-            # Jump targets can precede the marker by interpreter housekeeping.
-            exits.update(item.offset for item in instructions[max(0, index - 4):index + 1])
+            # Only padding and the exit handler's own PUSH_EXC_INFO belong
+            # to this marker. COPY/POP_EXCEPT/RERAISE immediately before it
+            # can be the genuine user's exception cleanup, not PyArmor's.
+            exits.add(instruction.offset)
+            previous = index - 1
+            while previous >= 0 and instructions[previous].opname in ('NOP', 'EXTENDED_ARG'):
+                exits.add(instructions[previous].offset)
+                previous -= 1
+            if previous >= 0 and instructions[previous].opname == 'PUSH_EXC_INFO':
+                exits.add(instructions[previous].offset)
         if name.startswith('__pyarmor_enter_'):
             end = next((item.offset for item in instructions[index + 1:index + 16]
                         if item.opname == 'POP_TOP'), None)
@@ -252,6 +288,39 @@ class DeadTailNormalizer(ast.NodeTransformer):
         return node
 
 
+class FutureAnnotationNormalizer(ast.NodeTransformer):
+    """Restore expression text serialized by future-annotations bytecode.
+
+    CPython's annotation function stores ``Any`` as the string 'Any'. Treating
+    that string as a quoted annotation in source changes it to "'Any'" on
+    recompilation. Parsing the stored expression also preserves annotations
+    that were explicitly quoted in the original source.
+    """
+
+    @staticmethod
+    def expression(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            try:
+                return ast.copy_location(ast.parse(node.value, mode='eval').body, node)
+            except SyntaxError:
+                return node
+        return node
+
+    def visit_arg(self, node):
+        node.annotation = self.expression(node.annotation)
+        return self.generic_visit(node)
+
+    def visit_FunctionDef(self, node):
+        node.returns = self.expression(node.returns)
+        return self.generic_visit(node)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_AnnAssign(self, node):
+        node.annotation = self.expression(node.annotation)
+        return self.generic_visit(node)
+
+
 def recover(sequence: Path, backend: Path) -> dict:
     """Use the native export beside sequence and write validated source + status."""
     prefix = Path(str(sequence).removesuffix('.seq'))
@@ -283,10 +352,14 @@ def recover(sequence: Path, backend: Path) -> dict:
             raise ValueError('Missing AES metadata in sequence')
         transformer = MarkerNormalizer(metadata[1:17], metadata[18:30])
         tree = ast.fix_missing_locations(DeadTailNormalizer().visit(transformer.visit(tree)))
+        if any(isinstance(statement, ast.ImportFrom) and statement.module == '__future__'
+               and any(alias.name == 'annotations' for alias in statement.names)
+               for statement in tree.body):
+            tree = ast.fix_missing_locations(FutureAnnotationNormalizer().visit(tree))
         source = ast.unparse(tree) + '\n'
         with warnings.catch_warnings(record=True) as found_warnings:
             warnings.simplefilter('always', SyntaxWarning)
-            compile(source, str(output), 'exec') # Validation only. Never execute.
+            compile(source, str(output), 'exec', dont_inherit=True) # Validation only. Never execute.
         report['syntax_warnings'] = [str(warning.message) for warning in found_warnings]
         unresolved_imports = any(isinstance(node, ast.Name) and node.id.startswith('_pyarmor_')
                                  for node in ast.walk(tree))

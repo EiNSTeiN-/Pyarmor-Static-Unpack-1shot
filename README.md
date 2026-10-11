@@ -28,6 +28,23 @@ was reported; it does **not** establish behavioral equivalence. Keep `.das`,
 `.recovered.pyc`, and `.modern.raw.py` for comparison. Sequence files contain
 runtime AES material and should remain private.
 
+The normalizer resolves closure cells by capture position, preserves genuine
+exception cleanup directly before an exit marker, and reconstructs future
+annotation expressions without extra quoting. A separate static verifier
+compares nested code units and keeps unsupported marker patterns as failures:
+
+```bash
+.venv/bin/python oneshot/bytecode_fidelity.py reference.recovered.pyc candidate.py \
+  --sequence reference.seq --report fidelity.json
+```
+
+It compares signatures, meaningful instructions, jump destinations, exception
+tables and docstrings after a narrow documented normalization of compiler and
+PyArmor bookkeeping. A zero exit status requires all matched code units to
+pass. A nonzero exit status or an unsupported marker is not proof of equivalence.
+Keyword parameter names, global/attribute names, constants and branch semantics
+remain significant. The verifier never imports either candidate program.
+
 Run the original-fixture regression tests with:
 
 ```bash
