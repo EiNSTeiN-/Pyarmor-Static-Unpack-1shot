@@ -90,6 +90,25 @@ def canonical(code, decoder=None):
     original = [item for item in dis.get_instructions(code) if item.opname not in PADDING]
     removed, replacements, unresolved = set(), {}, []
 
+    # CPython 3.13+ stores class source locations in the compiler header as
+    # well as co_firstlineno. Formatting changes may alter only that header
+    # value. An explicit user assignment later in the body stays significant.
+    if code.co_name != '<module>' and not code.co_flags & 1:
+        for index, item in enumerate(original):
+            if (index >= 4 and index + 1 < len(original)
+                    and item.opname in ('LOAD_CONST', 'LOAD_SMALL_INT')
+                    and isinstance(item.argval, int)
+                    and original[index - 4].opname == 'LOAD_NAME'
+                    and original[index - 4].argval == '__name__'
+                    and original[index - 3].opname == 'STORE_NAME'
+                    and original[index - 3].argval == '__module__'
+                    and original[index - 2].opname == 'LOAD_CONST'
+                    and original[index - 1].opname == 'STORE_NAME'
+                    and original[index - 1].argval == '__qualname__'
+                    and original[index + 1].opname == 'STORE_NAME'
+                    and original[index + 1].argval == '__firstlineno__'):
+                replacements[index] = ('LOAD_CONST', ('compiler_class_line',))
+
     def store(item):
         if item.opname == 'STORE_FAST':
             return (item.opname, local_operand(code, item.arg))

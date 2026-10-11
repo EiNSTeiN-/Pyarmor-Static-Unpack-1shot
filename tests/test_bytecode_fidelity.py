@@ -13,6 +13,14 @@ from modern_backend import MarkerNormalizer
 
 @unittest.skipUnless(sys.version_info[:2] == (3, 14), 'Requires CPython 3.14')
 class FidelityTests(unittest.TestCase):
+    def test_compiler_class_source_line_is_location_metadata(self):
+        source = 'class Result:\n    "Documented class."\n    value = 3\n'
+        self.assertTrue(self.check(source, '\n\n' + source)['all_units_match'])
+
+    def test_explicit_class_line_assignment_is_not_normalized(self):
+        self.assertFalse(self.check('class Result:\n    __firstlineno__ = 50\n',
+                                    'class Result:\n    __firstlineno__ = 100\n')['all_units_match'])
+
     def test_pyarmor_from_import_matches_explicit_bindings(self):
         payload = b'\x04' + marshal.dumps(('example', ('first', 'second'), 1))
         original = compile_source(f'a, b = "__pyarmor_assert_fixture__"({payload!r})\n', 'armored.py')

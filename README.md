@@ -44,6 +44,10 @@ PyArmor bookkeeping. A zero exit status requires all matched code units to
 pass. A nonzero exit status or an unsupported marker is not proof of equivalence.
 Keyword parameter names, global/attribute names, constants and branch semantics
 remain significant. The verifier never imports either candidate program.
+Compiler-generated class `__firstlineno__` values are location metadata, just
+like code-object line numbers. Only the recognized class header is normalized;
+an explicit assignment in the class body remains significant and is covered
+by a negative regression test.
 
 Run the original-fixture regression tests with:
 
