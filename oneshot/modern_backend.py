@@ -269,6 +269,14 @@ class DeadTailNormalizer(ast.NodeTransformer):
                 if isinstance(statement, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
                     setattr(node, field, statements[:index + 1])
                     break
+        required_body = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                         ast.If, ast.For, ast.AsyncFor, ast.While, ast.With,
+                         ast.AsyncWith, ast.Try, ast.TryStar, ast.ExceptHandler,
+                         ast.match_case)
+        if isinstance(node, required_body) and not node.body:
+            # Removing runtime-only statements can leave an otherwise valid
+            # empty class/function/suite. `pass` has no application behavior.
+            node.body = [ast.copy_location(ast.Pass(), node)]
         return node
 
     def visit_Module(self, node):

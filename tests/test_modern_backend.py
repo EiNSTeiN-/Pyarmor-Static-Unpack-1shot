@@ -110,6 +110,15 @@ class ModernBackendTests(native.Python314Tests):
 
 
 class NormalizationTests(unittest.TestCase):
+    def test_runtime_only_suites_remain_syntactically_valid(self):
+        import ast
+        source = 'class Result:\n    __assert_armored__ = "__pyarmor_assert_fixture__"\n'
+        tree = MarkerNormalizer(bytes(16), bytes(12)).visit(ast.parse(source))
+        tree = ast.fix_missing_locations(DeadTailNormalizer().visit(tree))
+        cleaned = ast.unparse(tree)
+        compile(cleaned, 'fixture.py', 'exec', dont_inherit=True)
+        self.assertIn('pass', cleaned)
+
     def test_future_annotations_preserve_expression_and_quoted_forward_reference(self):
         import ast
         tree = ast.parse('from __future__ import annotations\n'

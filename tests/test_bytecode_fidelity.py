@@ -1,5 +1,6 @@
 """The static verifier must reject semantic changes, not only syntax errors."""
 import dis
+import marshal
 from pathlib import Path
 import sys
 import types
@@ -7,10 +8,27 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'oneshot'))
 from bytecode_fidelity import compare, compile_source, constant
+from modern_backend import MarkerNormalizer
 
 
 @unittest.skipUnless(sys.version_info[:2] == (3, 14), 'Requires CPython 3.14')
 class FidelityTests(unittest.TestCase):
+    def test_pyarmor_from_import_matches_explicit_bindings(self):
+        payload = b'\x04' + marshal.dumps(('example', ('first', 'second'), 1))
+        original = compile_source(f'a, b = "__pyarmor_assert_fixture__"({payload!r})\n', 'armored.py')
+        candidate = compile_source('from .example import first as a, second as b\n', 'source.py')
+        decoder = MarkerNormalizer(bytes(16), bytes(12))
+        self.assertTrue(compare(original, candidate, decoder)['all_units_match'])
+        changed = compile_source('from .example import first as b, second as a\n', 'wrong.py')
+        self.assertFalse(compare(original, changed, decoder)['all_units_match'])
+
+    def test_pyarmor_import_matches_module_binding(self):
+        payload = b'\x03example'
+        original = compile_source(f'alias = "__pyarmor_assert_fixture__"({payload!r})\n', 'armored.py')
+        candidate = compile_source('import example as alias\n', 'source.py')
+        decoder = MarkerNormalizer(bytes(16), bytes(12))
+        self.assertTrue(compare(original, candidate, decoder)['all_units_match'])
+
     def test_compilation_does_not_inherit_verifier_future_flags(self):
         plain = compile_source('def select(value: int): return value\n', 'plain.py')
         explicit = compile_source('from __future__ import annotations\n'

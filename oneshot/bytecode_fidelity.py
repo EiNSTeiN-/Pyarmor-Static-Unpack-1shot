@@ -89,17 +89,53 @@ def canonical(code, decoder=None):
     """Apply an explicit, narrow whitelist; keep control flow and handlers."""
     original = [item for item in dis.get_instructions(code) if item.opname not in PADDING]
     removed, replacements, unresolved = set(), {}, []
+
+    def store(item):
+        if item.opname == 'STORE_FAST':
+            return (item.opname, local_operand(code, item.arg))
+        if item.opname in ('STORE_NAME', 'STORE_GLOBAL'):
+            return (item.opname, item.argval)
+        return None
+
+    # Ordinary import bytecode and PyArmor's positional tuple importer use
+    # different plumbing for the same explicit binding contract. Keep the
+    # module, relative level, imported names, and every destination significant.
     for index, item in enumerate(original):
+        if (index in removed or item.opname not in ('LOAD_CONST', 'LOAD_SMALL_INT')
+                or not isinstance(item.argval, int)):
+            continue
+        tail = original[index + 1:index + 3]
+        if len(tail) != 2 or [value.opname for value in tail] != ['LOAD_CONST', 'IMPORT_NAME']:
+            continue
+        names, module = tail[0].argval, tail[1].argval
+        if names is None and index + 3 < len(original) and store(original[index + 3]):
+            replacements[index] = ('IMPORT', (module, store(original[index + 3]), item.argval))
+            removed.update(range(index + 1, index + 4))
+        elif isinstance(names, tuple) and names and all(isinstance(name, str) for name in names):
+            imports = original[index + 3:index + 3 + 2 * len(names)]
+            end = index + 3 + len(imports)
+            if (len(imports) == 2 * len(names) and end < len(original)
+                    and original[end].opname == 'POP_TOP'
+                    and all(imports[2 * count].opname == 'IMPORT_FROM'
+                            and imports[2 * count].argval == name
+                            and store(imports[2 * count + 1]) for count, name in enumerate(names))):
+                bindings = tuple((name, store(imports[2 * count + 1])) for count, name in enumerate(names))
+                replacements[index] = ('FROM_IMPORT', (module, bindings, item.argval))
+                removed.update(range(index + 1, end + 1))
+
+    for index, item in enumerate(original):
+        if index in removed:
+            continue
         if (item.opname == 'LOAD_CONST' and isinstance(item.argval, str)
                 and item.argval.startswith('__pyarmor_assert_')
                 and index + 1 < len(original)
-                and original[index + 1].opname == 'STORE_FAST'
+                and original[index + 1].opname in ('STORE_FAST', 'STORE_NAME', 'STORE_GLOBAL')
                 and original[index + 1].argval == '__assert_armored__'):
             removed.update((index, index + 1))
             continue
         is_assert = ((item.opname == 'LOAD_CONST' and isinstance(item.argval, str)
                       and item.argval.startswith('__pyarmor_assert_'))
-                     or (item.opname in ('LOAD_FAST', 'LOAD_FAST_BORROW')
+                     or (item.opname in ('LOAD_FAST', 'LOAD_FAST_BORROW', 'LOAD_NAME', 'LOAD_GLOBAL')
                          and item.argval == '__assert_armored__'))
         if not is_assert:
             continue
@@ -110,6 +146,23 @@ def canonical(code, decoder=None):
                 and tail[2].arg == 1 and isinstance(tail[1].argval, bytes)):
             try:
                 value = decoder.decode(ast.Constant(tail[1].argval))
+                if isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
+                    after = index + 4
+                    if (value.func.id == '_pyarmor_import_marker' and after < len(original)
+                            and store(original[after])):
+                        replacements[index] = ('IMPORT', (value.args[0].value, store(original[after]), 0))
+                        removed.update(range(index + 1, after + 1))
+                        continue
+                    if (value.func.id == '_pyarmor_from_import_marker'
+                            and after < len(original) and original[after].opname == 'UNPACK_SEQUENCE'):
+                        module, names, level = (argument.value for argument in value.args)
+                        count = len(names)
+                        stores = original[after + 1:after + 1 + count]
+                        if original[after].arg == count and len(stores) == count and all(store(target) for target in stores):
+                            bindings = tuple((name, store(target)) for name, target in zip(names, stores))
+                            replacements[index] = ('FROM_IMPORT', (module, bindings, level))
+                            removed.update(range(index + 1, after + 1 + count))
+                            continue
                 if not isinstance(value, ast.Constant):
                     raise ValueError('Non-scalar marker requires a separate lowering rule')
                 replacements[index] = ('LOAD_CONST', constant(value.value))
