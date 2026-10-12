@@ -113,6 +113,17 @@ hooks, closures, generators and coroutines and reject different constants,
 parameters and handler types. The recovery report lists exactly the accepted
 unit paths in `verified_shared_return_shapes`.
 
+Attribute callable values can retain their original unoptimized lookup using
+`(target.method if True else None)(...)`. The folded condition performs no
+runtime test. The source pass reuses existing attributes and arguments and
+accepts a trial only after its whole unit matches and every prior match survives.
+It preserves the distinction between `LOAD_ATTR` plus `PUSH_NULL` and the method
+call optimization; the verifier does not normalize that distinction away.
+Owned tests cover descriptors, argument/call order and errors, bound methods,
+lazy closures, coroutine handlers and cancellation. Altered attributes,
+arguments and mixed call shapes remain unproven. Accepted units are listed in
+`verified_attribute_callable_values` in the recovery report.
+
 Python 3.14 may also create a module's conditional-annotation set implicitly.
 An explicit guessed empty dictionary in generated source would overwrite that
 real binding. The source pass removes it only when the entire module unit then

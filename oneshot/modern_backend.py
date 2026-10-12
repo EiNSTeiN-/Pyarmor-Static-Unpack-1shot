@@ -1013,6 +1013,78 @@ def preserve_shared_returns(tree, reference, decoder):
     return tree, sorted(selected)
 
 
+def restore_attribute_callable_values(tree, reference, decoder):
+    """Preserve callable-value loads only after full unit proof.
+
+    A folded condition retains LOAD_ATTR without the method-call optimization.
+    Reuse only existing attribute/argument expressions, and reject any trial
+    that fails unit comparison or loses a previously matched unit.
+    """
+    try:
+        from .bytecode_fidelity import canonical, compare, compile_source, units
+    except ImportError:
+        from bytecode_fidelity import canonical, compare, compile_source, units
+
+    def checked():
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', SyntaxWarning)
+            compiled = compile_source(ast.unparse(ast.fix_missing_locations(tree)), '<attribute-trial>')
+        return compiled, compare(reference, compiled, decoder)
+    # Reparse once so AST/code line locations share a single source rendering.
+    tree = ast.parse(ast.unparse(ast.fix_missing_locations(tree)))
+    candidate, before = checked()
+    matching = {e['unit'] for e in before['entries'] if e['matched']}
+    references = dict(units(normalize_code(reference)))
+    candidates = dict(units(candidate))
+    nodes = defaultdict(list)
+    scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda, ast.GeneratorExp)
+    for node in ast.walk(tree):
+        if isinstance(node, scopes):
+            name = ('<lambda>' if isinstance(node, ast.Lambda) else
+                    '<genexpr>' if isinstance(node, ast.GeneratorExp) else node.name)
+            nodes[name, node.lineno].append(node)
+    def direct_calls(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, scopes): continue
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute): yield child
+            yield from direct_calls(child)
+    attempted = {}
+    for path, code in candidates.items():
+        if path in matching or path not in references: continue
+        scope_nodes = nodes[code.co_name, code.co_firstlineno]
+        if len(scope_nodes) != 1: continue
+        original = canonical(references[path], decoder).instructions
+        rebuilt = canonical(code, decoder).instructions
+        needed = {instruction[1][0] for instruction, after in zip(original, original[1:])
+                  if instruction[0] == 'LOAD_ATTR' and instruction[1][1] == 0
+                  and after[0] == 'PUSH_NULL'}
+        optimized = {instruction[1][0] for instruction in rebuilt
+                     if instruction[0] == 'LOAD_ATTR' and instruction[1][1] == 1}
+        wanted = needed & optimized
+        edits = []
+        for call in direct_calls(scope_nodes[0]):
+            if call.func.attr not in wanted: continue
+            previous = call.func
+            call.func = ast.IfExp(ast.Constant(True), previous, ast.Constant(None))
+            edits.append((call, previous))
+        if edits: attempted[path] = edits
+    if not attempted: return tree, []
+    _, tentative = checked()
+    proved = {e['unit'] for e in tentative['entries'] if e['matched']}
+    selected = {}
+    for path, edits in attempted.items():
+        if path in proved: selected[path] = edits
+        else:
+            for call, previous in edits: call.func = previous
+    _, final = checked()
+    after = {e['unit'] for e in final['entries'] if e['matched']}
+    if not matching.issubset(after) or not set(selected).issubset(after):
+        for edits in selected.values():
+            for call, previous in edits: call.func = previous
+        return tree, []
+    return tree, sorted(after-matching)
+
+
 def recover(sequence: Path, backend: Path) -> dict:
     """Use the native export beside sequence and write validated source + status."""
     prefix = Path(str(sequence).removesuffix('.seq'))
@@ -1054,6 +1126,7 @@ def recover(sequence: Path, backend: Path) -> dict:
         tree, report['verified_try_return_scopes'] = restore_try_return_scope(tree, code, transformer)
         tree, report['verified_capture_name_order'] = restore_capture_name_order(tree, code, transformer)
         tree, report['verified_compound_return_shapes'] = restore_compound_return_shapes(tree, code, transformer)
+        tree, report['verified_attribute_callable_values'] = restore_attribute_callable_values(tree, code, transformer)
         source = ast.unparse(tree) + '\n'
         if report['verified_shared_return_shapes']:
             lines = []
