@@ -133,6 +133,15 @@ away after the return was hoisted. These cases can initially fail instruction
 comparison; they still require a full code-unit match after repair. Owned
 fixtures retain handled missing attributes and unhandled property failures.
 
+Private captured names can also disrupt CPython's lexical closure-cell order.
+The source pass derives ordering constraints from the recovered capture tuples
+and chooses nonconflicting private spellings. It preserves public parameter and
+global names, skips incompatible constraints and accepts a trial only when new
+units match and every prior match survives. Parent capture tuples and child
+slot uses both remain significant in the verifier. Owned tests compare closure
+values, generators, nonlocal mutations and late bound attributes, and reject
+changed capture uses. Newly proven paths appear in `verified_capture_name_order`.
+
 Run the original-fixture regression tests with:
 
 ```bash

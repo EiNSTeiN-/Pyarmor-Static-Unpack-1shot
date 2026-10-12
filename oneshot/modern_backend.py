@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 from collections import defaultdict
 import dis
+import heapq
 import importlib.util
 import json
 import keyword
@@ -612,6 +613,126 @@ def restore_module_annotation_binding(tree, reference, decoder):
     return tree, False
 
 
+def restore_capture_name_order(tree, reference, decoder):
+    """Choose private capture spellings that preserve the proven cell order.
+
+    CPython sorts nonparameter cells and free-variable names lexically. PyArmor
+    may rename those names while retaining their original tuple positions.
+    Compile a constraint-derived spelling trial, never permute verifier slots.
+    Public parameters, global names and ambiguous ordering remain unchanged.
+    """
+    try:
+        from .bytecode_fidelity import compare, compile_source, units
+    except ImportError:
+        from bytecode_fidelity import compare, compile_source, units
+
+    def check(candidate_tree):
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', SyntaxWarning)
+            candidate = compile_source(ast.unparse(ast.fix_missing_locations(candidate_tree)),
+                                       '<capture-name-candidate>')
+        return compare(reference, candidate, decoder)
+
+    before = check(tree)
+    if before['all_units_match']:
+        return tree, []
+    codes = [code for _, code in units(normalize_code(reference))]
+    occupied = set().union(*(set(code.co_names) | set(code.co_varnames) |
+                            set(code.co_freevars) | set(code.co_cellvars) for code in codes))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            occupied.add(node.id)
+        elif isinstance(node, ast.arg):
+            occupied.add(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            occupied.add(node.name)
+        elif isinstance(node, ast.alias):
+            occupied.add(node.asname or node.name.split('.')[0])
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            occupied.add(node.name)
+    forbidden = set()
+    graph = defaultdict(set)
+    for code in codes:
+        parameter_count = code.co_argcount + code.co_kwonlyargcount
+        parameter_count += bool(code.co_flags & 4) + bool(code.co_flags & 8)
+        parameters = code.co_varnames[:parameter_count]
+        forbidden.update(code.co_names)
+        forbidden.update(parameters)
+        for sequence in (code.co_freevars,
+                         tuple(name for name in code.co_cellvars if name not in parameters)):
+            for name in sequence:
+                graph[name]
+            for left, right in zip(sequence, sequence[1:]):
+                graph[left].add(right)
+    private = {name for name in graph if name.startswith('_var_var_') and name not in forbidden}
+    if not private:
+        return tree, []
+    fixed = sorted(set(graph) - private)
+    for left, right in zip(fixed, fixed[1:]):
+        graph[left].add(right)
+    incoming = {name: 0 for name in graph}
+    for targets in graph.values():
+        for name in targets:
+            incoming[name] += 1
+    queue = [(name not in private, name) for name, count in incoming.items() if count == 0]
+    heapq.heapify(queue)
+    ordered = []
+    while queue:
+        _, name = heapq.heappop(queue)
+        ordered.append(name)
+        for target in graph[name]:
+            incoming[target] -= 1
+            if incoming[target] == 0:
+                heapq.heappush(queue, (target not in private, target))
+    if len(ordered) != len(graph):
+        return tree, []
+    names = {}
+    previous = None
+    anchor = None
+    for index, name in enumerate(ordered):
+        if name not in private:
+            previous = anchor = name
+            continue
+        next_fixed = next((other for other in ordered[index + 1:] if other not in private), None)
+        if anchor is None:
+            candidates = [f'A_recovered_capture_{index:04d}', f'_recovered_capture_{index:04d}',
+                          f'a_recovered_capture_{index:04d}']
+        else:
+            candidates = [f'{anchor}__recovered_capture_{index:04d}',
+                          f'{anchor}0_recovered_capture_{index:04d}']
+        chosen = next((value for value in candidates if value not in occupied
+                       and (previous is None or previous < value)
+                       and (next_fixed is None or value < next_fixed)), None)
+        if chosen is None:
+            return tree, []
+        names[name] = chosen
+        occupied.add(chosen)
+        previous = chosen
+
+    class Rename(ast.NodeTransformer):
+        def visit_Name(self, node):
+            node.id = names.get(node.id, node.id)
+            return node
+        def visit_ExceptHandler(self, node):
+            node.name = names.get(node.name, node.name)
+            return self.generic_visit(node)
+        def visit_alias(self, node):
+            node.asname = names.get(node.asname, node.asname)
+            return node
+        def visit_Nonlocal(self, node):
+            node.names = [names.get(name, name) for name in node.names]
+            return node
+
+    # Parse a new tree rather than mutating the original before proof is known.
+    trial = Rename().visit(ast.parse(ast.unparse(tree)))
+    after = check(trial)
+    old_matches = {entry['unit'] for entry in before['entries'] if entry['matched']}
+    new_matches = {entry['unit'] for entry in after['entries'] if entry['matched']}
+    if not old_matches.issubset(new_matches) or not new_matches - old_matches:
+        return tree, []
+    return trial, sorted(new_matches - old_matches)
+
+
 def restore_try_return_scope(tree, reference, decoder):
     """Restore a hoisted final return only after exact exception-dispatch proof."""
     try:
@@ -827,6 +948,7 @@ def recover(sequence: Path, backend: Path) -> dict:
         tree, report['verified_module_annotation_binding'] = restore_module_annotation_binding(tree, code, transformer)
         tree, report['verified_shared_return_shapes'] = preserve_shared_returns(tree, code, transformer)
         tree, report['verified_try_return_scopes'] = restore_try_return_scope(tree, code, transformer)
+        tree, report['verified_capture_name_order'] = restore_capture_name_order(tree, code, transformer)
         source = ast.unparse(tree) + '\n'
         if report['verified_shared_return_shapes']:
             lines = []
