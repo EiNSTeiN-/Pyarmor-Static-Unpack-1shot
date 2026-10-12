@@ -128,3 +128,63 @@ async def stream():
         self.assertEqual(second, [])
         self.assertEqual(ast.unparse(tree), source)
         self.assertTrue(compare(code, compile_source(source, 'candidate'))['all_units_match'])
+
+    def test_explicit_false_return_keeps_handled_comparison_errors(self):
+        reference = '''def gate(value):
+    try:
+        if float(value) <= 0:
+            return True
+    except (ValueError, TypeError):
+        pass
+    return False if True else None
+'''
+        candidate = reference.replace('return False if True else None', 'return False')
+        code, source, selected = self.recover(reference, candidate)
+        self.assertEqual(selected, ['<module>/gate#1'])
+        self.assertTrue(compare(code, compile_source(source, 'candidate'))['all_units_match'])
+        original, recovered = {}, {}
+        exec(code, original); exec(compile_source(source, 'candidate'), recovered)
+        for value in (None, 'invalid', -1, 0, 1, float('nan')):
+            self.assertEqual(recovered['gate'](value), original['gate'](value))
+
+    def test_existing_conditional_value_return_preserves_identity_call_order_and_raises(self):
+        reference = ('def choose(flag, first, second):\n'
+                     '    return (first() if flag else second()) if True else None\n')
+        candidate = 'def choose(flag, first, second):\n    return first() if flag else second()\n'
+        code, source, selected = self.recover(reference, candidate)
+        # This compiler already shares the call-valued return. Keep that
+        # matching source unchanged rather than forcing the folded spelling.
+        self.assertEqual(selected, [])
+        self.assertTrue(compare(code, compile_source(source, 'candidate'))['all_units_match'])
+        original, recovered = {}, {}
+        exec(code, original); exec(compile_source(source, 'candidate'), recovered)
+        sentinel = object()
+        for flag in (False, True):
+            for raises in (False, True):
+                outcomes = []
+                for namespace in (original, recovered):
+                    calls = []
+                    def callback(name):
+                        def run():
+                            calls.append(name)
+                            if raises:
+                                raise ValueError('owned callback failure')
+                            return sentinel
+                        return run
+                    try:
+                        result = namespace['choose'](flag, callback('first'), callback('second'))
+                        self.assertIs(result, sentinel)
+                    except ValueError as error:
+                        result = (type(error).__name__, str(error))
+                    outcomes.append((result, calls))
+                self.assertEqual(outcomes[1], outcomes[0])
+
+    def test_explicit_return_value_and_branch_changes_still_fail(self):
+        reference = ('def gate(flag, event):\n    if flag:\n        event("called")\n'
+                     '    return False if True else None\n')
+        candidates = [reference.replace('return False if True else None', 'return True'),
+                      reference.replace('return False if True else None', 'return False').replace('if flag:', 'if not flag:')]
+        for candidate in candidates:
+            code, source, selected = self.recover(reference, candidate)
+            self.assertEqual(selected, [])
+            self.assertFalse(compare(code, compile_source(source, 'candidate'))['all_units_match'])

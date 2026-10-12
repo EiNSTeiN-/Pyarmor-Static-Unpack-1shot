@@ -615,10 +615,11 @@ def restore_module_annotation_binding(tree, reference, decoder):
 def preserve_shared_returns(tree, reference, decoder):
     """Retain a compiler shared-return shape only after exact unit proof.
 
-    CPython can duplicate an implicit terminal None return. A constant-folded
-    expression at the end of the source instead keeps the shared edge found in
-    some recovered functions. This changes no runtime predicate and supplies
-    no missing work. Never accept it on syntax or behavior tests alone.
+    CPython can duplicate terminal returns. A constant-folded expression at the
+    end of the source instead keeps the shared edge found in some recovered
+    functions. Preserve an existing return's value expression exactly; implicit
+    returns still produce None. This supplies no missing work and runs no new
+    predicate. Never accept it on syntax or behavior tests alone.
     """
     # Import lazily: the verifier itself imports this normalizer. Both tools
     # are fully initialized by the time source reconstruction reaches here.
@@ -673,25 +674,37 @@ def preserve_shared_returns(tree, reference, decoder):
         if path in before or code.co_flags & 0x200:
             continue
         node = nodes[0]
-        node.body.append(ast.Return(ast.IfExp(ast.Constant(True), ast.Constant(None), ast.Constant(None))))
-        attempted[path] = node
+        previous = node.body[-1] if node.body and isinstance(node.body[-1], ast.Return) else None
+        value = previous.value if previous is not None and previous.value is not None else ast.Constant(None)
+        replacement = ast.Return(ast.IfExp(ast.Constant(True), value, ast.Constant(None)))
+        if previous is None:
+            node.body.append(replacement)
+        else:
+            node.body[-1] = replacement
+        attempted[path] = (node, previous)
     if not attempted:
         return tree, []
     tested = matched(checked_compile())
     selected = {}
-    for path, node in attempted.items():
-        if path in tested:
-            selected[path] = node
-        else:
+    def revert(node, previous):
+        if previous is None:
             node.body.pop()
+        else:
+            node.body[-1] = previous
+
+    for path, (node, previous) in attempted.items():
+        if path in tested:
+            selected[path] = (node, previous)
+        else:
+            revert(node, previous)
     if not selected:
         return tree, []
     after = matched(checked_compile())
     if not before.issubset(after) or not set(selected).issubset(after):
         # Removing an unproven neighboring change must not invalidate either
         # an old match or an accepted new one. Fall back without any edits.
-        for node in selected.values():
-            node.body.pop()
+        for node, previous in selected.values():
+            revert(node, previous)
         return tree, []
     return tree, sorted(selected)
 
@@ -738,7 +751,7 @@ def recover(sequence: Path, backend: Path) -> dict:
         if report['verified_shared_return_shapes']:
             lines = []
             for line in source.splitlines():
-                if line.lstrip() == 'return None if True else None':
+                if line.lstrip().startswith('return ') and line.rstrip().endswith(' if True else None'):
                     indent = line[:len(line) - len(line.lstrip())]
                     lines.append(indent + '# Folded expression preserves the verified shared-return edge.')
                 lines.append(line)

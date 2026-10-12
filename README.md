@@ -101,8 +101,10 @@ Changing either operation alone, its target, or intervening meaningful work
 still fails. An owned behavior test includes objects whose truth/equality
 methods raise, and negative tests enforce those boundaries.
 
-Source reconstruction can preserve a shared terminal None return with a
-constant-folded `return None if True else None` expression. The tool accepts this
+Source reconstruction can preserve a shared terminal return with a
+constant-folded `return value if True else None` expression. An existing final
+return keeps its exact value expression; implicit returns use None. This also
+preserves shared boolean-return paths through handled errors. The tool accepts this
 only when the entire function unit (including signature, branches and exception
 dispatch) then matches the recovered bytecode. It reverts unproven attempts,
 skips ambiguous definitions and async generators, and checks that no previously
