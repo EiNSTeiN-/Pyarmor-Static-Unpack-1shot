@@ -112,6 +112,47 @@ class ModernBackendTests(native.Python314Tests):
         # The optional backend supports the native backend's documented gap.
         super().test_context_manager()
 
+    def test_shared_try_fragments_preserve_property_getters_and_comparison_errors(self):
+        from bytecode_fidelity import compare, compile_source
+        source = ('class Sensor:\n'
+                  '    @property\n    def icon(self):\n'
+                  '        try:\n            trend = self.trend\n'
+                  '            if trend > 10:\n                return "high"\n'
+                  '            if trend > 5:\n                return "rising"\n'
+                  '            if trend < -10:\n                return "low"\n'
+                  '            if trend < -5:\n                return "falling"\n'
+                  '        except Exception:\n            return "fallback"\n'
+                  '        return "ordinary"\n')
+        original, recovered = self.recover(source)
+        self.assertTrue(compare(compile_source(source, 'owned-original'),
+                                compile_source(self.last_generated, 'owned-recovered'))['all_units_match'])
+        def exercise(sensor_class, number, failure):
+            calls = []
+            class Value:
+                def __gt__(self, limit):
+                    calls.append(('gt', limit))
+                    if failure == 'comparison': raise ValueError('owned comparison')
+                    return number > limit
+                def __lt__(self, limit):
+                    calls.append(('lt', limit))
+                    if failure == 'comparison': raise ValueError('owned comparison')
+                    return number < limit
+            class Reading(sensor_class):
+                @property
+                def trend(self):
+                    calls.append('getter')
+                    if failure == 'getter': raise AttributeError('owned getter')
+                    if failure == 'base': raise KeyboardInterrupt('owned interrupted getter')
+                    return Value()
+            try: outcome = ('value', Reading().icon)
+            except KeyboardInterrupt as error: outcome = ('KeyboardInterrupt', str(error))
+            return outcome, calls
+        for number in (-11, -10, -6, -5, 0, 5, 6, 10, 11, float('nan')):
+            for failure in ('', 'getter', 'comparison', 'base'):
+                self.assertEqual(exercise(recovered['Sensor'], number, failure),
+                                 exercise(original['Sensor'], number, failure))
+        self.assertEqual(exercise(recovered['Sensor'], 0, '')[0], ('value', 'ordinary'))
+
     def test_chained_inline_filters_keep_each_positive_and_negative_guard(self):
         from bytecode_fidelity import compare, compile_source
         for kind in ('list', 'set', 'dict'):

@@ -37,6 +37,14 @@ expression, without a with protocol. Native export, modern reconstruction and
 whole-unit verification are tested together, including call/getter failures,
 fallback paths and base exceptions. Comparison and normalization rules stay
 unchanged.
+Early-return exception-table fragments can also leave duplicated consecutive
+`try` blocks. Source reconstruction reunites only adjacent suites with
+identical handlers and no else/finally, then requires the complete original
+code unit to match and every earlier unit match to survive. Independent tries,
+intervening work and unproved candidates keep their existing code. Nested
+suites are processed before enclosing concatenations, and definitions have
+separate trial scopes. Owned sync, coroutine and property fixtures check
+handled errors, cancellation, return/getter order and rejected scope changes.
 The lookup repair requires an unprotected suite, the assigned local's later
 None guard and a return of that same local. Other guard and handler layouts keep
 their existing handling; broad guard inversion failed corpus-retention checks.

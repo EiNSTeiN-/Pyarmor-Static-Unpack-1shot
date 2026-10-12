@@ -837,6 +837,124 @@ def restore_compound_return_shapes(tree, reference, decoder):
     return tree, accepted
 
 
+def restore_shared_try_fragments(tree, reference, decoder):
+    """Reunite duplicate lexical handlers only after complete unit proof.
+
+    Early returns split an exception table's protected body. A structured
+    backend can emit those fragments as consecutive tries with copied
+    handlers. Identical source handlers alone do not establish equivalence:
+    a trial must match the original instructions and dispatch map and retain
+    every previously matched unit. Else/finally suites and intervening work
+    are not candidates for this reconstruction.
+    """
+    try:
+        from .bytecode_fidelity import compare, compile_source, units
+    except ImportError:
+        from bytecode_fidelity import compare, compile_source, units
+
+    class Definitions(ast.NodeVisitor):
+        def __init__(self):
+            self.prefix = ''
+            self.nodes = defaultdict(list)
+        def visit_ClassDef(self, node):
+            previous = self.prefix
+            self.prefix += node.name + '.'
+            self.generic_visit(node)
+            self.prefix = previous
+        def visit_FunctionDef(self, node):
+            name = self.prefix + node.name
+            self.nodes[name].append(node)
+            previous = self.prefix
+            self.prefix = name + '.<locals>.'
+            self.generic_visit(node)
+            self.prefix = previous
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+    def check():
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', SyntaxWarning)
+            candidate = compile_source(ast.unparse(ast.fix_missing_locations(tree)),
+                                       '<shared-try-fragments-candidate>')
+        return candidate, compare(reference, candidate, decoder)
+
+    def blocks(node):
+        # Inner suites must be processed before an enclosing concatenation
+        # copies their statements. Definitions have their own trial scope.
+        for child in ast.iter_child_nodes(node):
+            if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                      ast.ClassDef, ast.Lambda)):
+                yield from blocks(child)
+        for _, value in ast.iter_fields(node):
+            if isinstance(value, list) and value and isinstance(value[0], ast.stmt):
+                yield value
+
+    def handler_key(node):
+        if not isinstance(node, ast.Try) or not node.handlers or node.orelse or node.finalbody:
+            return None
+        return ast.dump(ast.Module(node.handlers, []), include_attributes=False)
+
+    def revert(edits):
+        for block, index, original in reversed(edits):
+            block[index:index + 1] = original
+
+    # Avoid a whole-tree comparison when there is no adjacent candidate.
+    if not any(handler_key(first) is not None and handler_key(first) == handler_key(second)
+               for owner in ast.walk(tree) for _, block in ast.iter_fields(owner)
+               if isinstance(block, list)
+               for first, second in zip(block, block[1:])):
+        return tree, []
+
+    candidate, baseline = check()
+    matching = {entry['unit'] for entry in baseline['entries'] if entry['matched']}
+    by_name = defaultdict(list)
+    for path, code in units(candidate):
+        by_name[code.co_qualname].append(path)
+    definitions = Definitions()
+    definitions.visit(tree)
+    attempted = {}
+    for name, nodes in definitions.nodes.items():
+        if len(nodes) != 1 or len(by_name[name]) != 1 or by_name[name][0] in matching:
+            continue
+        edits = []
+        for block in blocks(nodes[0]):
+            index = len(block) - 1
+            while index > 0:
+                key = handler_key(block[index])
+                if key is None:
+                    index -= 1
+                    continue
+                first = index
+                while first > 0 and handler_key(block[first - 1]) == key:
+                    first -= 1
+                if first < index:
+                    original = block[first:index + 1]
+                    body = [statement for region in original for statement in region.body]
+                    block[first:index + 1] = [ast.Try(body, original[0].handlers, [], [])]
+                    edits.append((block, first, original))
+                index = first - 1
+        if edits:
+            attempted[by_name[name][0]] = edits
+    if not attempted:
+        return tree, []
+    _, tentative = check()
+    tested = {entry['unit'] for entry in tentative['entries'] if entry['matched']}
+    selected = {}
+    for path, edits in attempted.items():
+        if path in tested:
+            selected[path] = edits
+        else:
+            revert(edits)
+    if not selected:
+        return tree, []
+    _, final = check()
+    after = {entry['unit'] for entry in final['entries'] if entry['matched']}
+    if not matching.issubset(after) or not set(selected).issubset(after):
+        for edits in reversed(list(selected.values())):
+            revert(edits)
+        return tree, []
+    return tree, sorted(selected)
+
+
 def restore_try_return_scope(tree, reference, decoder):
     """Restore hoisted block-tail returns only after exact dispatch proof."""
     try:
@@ -1237,6 +1355,7 @@ def recover(sequence: Path, backend: Path) -> dict:
         tree, report['verified_compound_return_shapes'] = restore_compound_return_shapes(tree, code, transformer)
         tree, report['verified_attribute_callable_values'] = restore_attribute_callable_values(tree, code, transformer)
         tree, report['verified_shared_branch_return_shapes'] = preserve_shared_branch_returns(tree, code, transformer)
+        tree, report['verified_shared_try_fragments'] = restore_shared_try_fragments(tree, code, transformer)
         source = ast.unparse(tree) + '\n'
         if report['verified_shared_return_shapes']:
             lines = []
