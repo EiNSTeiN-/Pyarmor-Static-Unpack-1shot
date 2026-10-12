@@ -99,13 +99,13 @@ async def notify(flag, event):
             self.assertNotIn('return None if True else None', source)
 
     def test_ambiguous_definitions_and_async_generators_are_left_unchanged(self):
-        reference = '''def finish(flag):
+        reference = '''def finish(flag, event):
     if flag:
-        pass
+        event(flag)
     return None if True else None
-def finish(flag):
+def finish(flag, event):
     if flag:
-        pass
+        event(flag)
     return None if True else None
 async def stream():
     yield 1
