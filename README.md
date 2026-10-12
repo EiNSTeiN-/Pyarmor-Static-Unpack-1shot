@@ -123,6 +123,19 @@ hooks, closures, generators and coroutines and reject different constants,
 parameters and handler types. The recovery report lists exactly the accepted
 unit paths in `verified_shared_return_shapes`.
 
+The related branch-return pass tries at most four constant-folded layers around
+existing returns, including returns inside rejection guards. This preserves
+some shared keyword-call or dictionary tails that one folded layer cannot
+retain. CPython 3.14's [flow-graph optimizer](https://github.com/python/cpython/blob/v3.14.2/Python/flowgraph.c)
+can copy small exit blocks with a four-instruction limit. Each trial still has
+to match the complete code unit, including exception dispatch, and retain every
+earlier match after unsuccessful neighboring edits are reverted. Nested
+definitions are collected independently; async generators are skipped.
+`verified_shared_branch_return_shapes` records accepted paths. Owned tests
+cover descriptors, arguments, chained rich comparisons, dictionaries, nested
+closures, handled coroutine errors and cancellation; changed contracts remain
+failures. These folded expressions supply no runtime predicate or missing work.
+
 Attribute callable values can retain their original unoptimized lookup using
 `(target.method if True else None)(...)`. The folded condition performs no
 runtime test. The source pass reuses existing attributes and arguments and

@@ -1085,6 +1085,97 @@ def restore_attribute_callable_values(tree, reference, decoder):
     return tree, sorted(after-matching)
 
 
+def preserve_shared_branch_returns(tree, reference, decoder):
+    """Keep shared short return blocks with bounded, fully proved folding.
+
+    CPython's flow-graph optimizer can inline an exit block of at most four
+    instructions. Constant-folded expression edges can retain the original
+    shared block. Try one through four layers around existing return values;
+    no predicate, argument, call or handler is supplied or removed. Accept
+    only full-unit matches and retain all earlier matches after reverting
+    unsuccessful neighboring trials. Never traverse a nested definition from
+    its parent's return collector.
+    """
+    try:
+        from .bytecode_fidelity import compare, compile_source, units
+    except ImportError:
+        from bytecode_fidelity import compare, compile_source, units
+
+    def checked():
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', SyntaxWarning)
+            compiled = compile_source(ast.unparse(ast.fix_missing_locations(tree)), '<return-block-trial>')
+        return compiled, {entry['unit'] for entry in compare(reference, compiled, decoder)['entries']
+                          if entry['matched']}
+
+    # Match source scopes to code objects using this exact source rendering.
+    tree = ast.parse(ast.unparse(ast.fix_missing_locations(tree)))
+    scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda, ast.GeneratorExp)
+    nodes = defaultdict(list)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            nodes[node.name, node.lineno].append(node)
+
+    def returns(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, scopes):
+                continue
+            if isinstance(child, ast.Return):
+                yield child
+            else:
+                yield from returns(child)
+
+    candidate, before = checked()
+    candidates = dict(units(candidate))
+    eligible = {}
+    for path, code in candidates.items():
+        definitions = nodes[code.co_name, code.co_firstlineno]
+        if path in before or code.co_flags & 0x200 or len(definitions) != 1:
+            continue
+        statements = list(returns(definitions[0]))
+        if statements:
+            eligible[path] = [(statement, statement.value) for statement in statements]
+    if not eligible:
+        return tree, []
+
+    selected = {}
+    for depth in range(1, 5):
+        attempted = {path: edits for path, edits in eligible.items() if path not in selected}
+        if not attempted:
+            break
+        for edits in attempted.values():
+            for statement, previous in edits:
+                value = previous if previous is not None else ast.Constant(None)
+                for _ in range(depth):
+                    value = ast.IfExp(ast.Constant(True), value, ast.Constant(None))
+                statement.value = value
+        _, tentative = checked()
+        newly_selected = {}
+        for path, edits in attempted.items():
+            if path in tentative:
+                newly_selected[path] = edits
+            else:
+                for statement, previous in edits:
+                    statement.value = previous
+        if not newly_selected:
+            continue
+        _, after = checked()
+        required = before | selected.keys() | newly_selected.keys()
+        if not required.issubset(after):
+            for edits in newly_selected.values():
+                for statement, previous in edits:
+                    statement.value = previous
+            continue
+        selected.update(newly_selected)
+    _, final = checked()
+    if not (before | selected.keys()).issubset(final):
+        for edits in selected.values():
+            for statement, previous in edits:
+                statement.value = previous
+        return tree, []
+    return tree, sorted(selected)
+
+
 def recover(sequence: Path, backend: Path) -> dict:
     """Use the native export beside sequence and write validated source + status."""
     prefix = Path(str(sequence).removesuffix('.seq'))
@@ -1127,6 +1218,7 @@ def recover(sequence: Path, backend: Path) -> dict:
         tree, report['verified_capture_name_order'] = restore_capture_name_order(tree, code, transformer)
         tree, report['verified_compound_return_shapes'] = restore_compound_return_shapes(tree, code, transformer)
         tree, report['verified_attribute_callable_values'] = restore_attribute_callable_values(tree, code, transformer)
+        tree, report['verified_shared_branch_return_shapes'] = preserve_shared_branch_returns(tree, code, transformer)
         source = ast.unparse(tree) + '\n'
         if report['verified_shared_return_shapes']:
             lines = []
