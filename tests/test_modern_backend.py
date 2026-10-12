@@ -112,6 +112,26 @@ class ModernBackendTests(native.Python314Tests):
         # The optional backend supports the native backend's documented gap.
         super().test_context_manager()
 
+    def test_chained_inline_filters_keep_each_positive_and_negative_guard(self):
+        from bytecode_fidelity import compare, compile_source
+        for kind in ('list', 'set', 'dict'):
+            for guard in ('isinstance(value, str)', 'not isinstance(value, str)'):
+                for join in (' and ', ' if '):
+                    opening, closing = ('[', ']') if kind == 'list' else ('{', '}')
+                    element = 'value: value' if kind == 'dict' else 'value'
+                    source = ('def select(values):\n'
+                              f'    return {opening}{element} for value in values '
+                              f'if {guard}{join}value{closing}\n')
+                    with self.subTest(kind=kind, guard=guard, join=join):
+                        original, reconstructed = self.recover(source)
+                        self.assertTrue(compare(compile_source(source, 'owned-reference'),
+                                                compile_source(self.last_generated, 'owned-candidate'))
+                                        ['all_units_match'])
+                        for values in ([], ['', 'kept', None, 0, 2, 'again'],
+                                       ['repeat', 'repeat', False, True]):
+                            self.assertEqual(reconstructed['select'](values),
+                                             original['select'](values))
+
     def test_annotated_class_preserves_docstring_and_annotations(self):
         original, reconstructed = self.recover(
             'from __future__ import annotations\n'

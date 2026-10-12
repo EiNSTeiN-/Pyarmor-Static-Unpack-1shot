@@ -199,6 +199,13 @@ cancellation. Accepted unit/shape pairs appear in `verified_compound_return_shap
 
 Run the original-fixture regression tests with:
 
+CI pins modern backend **0.6.11-einstein.1**. Its chained inline-comprehension
+repair distinguishes an accepting jump into the next guard from a skip edge;
+the unpacker has an end-to-end regression for lists, sets and dictionaries,
+positive/negative predicates, conjunctions and successive filters. Every
+generated fixture receives complete code-tree comparison and value checks.
+This repair changes source generation, without adding a comparison allowance.
+
 ```bash
 PYARMOR_MODERN_BACKEND=/path/to/pycdc-modern/target/release/pycdc \
   .venv/bin/python -B -m unittest discover -s tests -v
