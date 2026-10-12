@@ -142,6 +142,14 @@ slot uses both remain significant in the verifier. Owned tests compare closure
 values, generators, nonlocal mutations and late bound attributes, and reject
 changed capture uses. Newly proven paths appear in `verified_capture_name_order`.
 
+Conditional return values split into separate statements, and lost boolean
+short-circuit arms left as empty branches, are reconstructed from their existing
+tests and values. Full-unit comparison and preservation of every old match gate
+each accepted shape. Legitimate empty branches and changed business values are
+retained or rejected rather than guessed away. Owned fixtures check nested
+value construction, rich comparison results/truth order, await failures and
+cancellation. Accepted unit/shape pairs appear in `verified_compound_return_shapes`.
+
 Run the original-fixture regression tests with:
 
 ```bash

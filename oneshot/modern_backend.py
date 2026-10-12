@@ -733,6 +733,110 @@ def restore_capture_name_order(tree, reference, decoder):
     return trial, sorted(new_matches - old_matches)
 
 
+def restore_compound_return_shapes(tree, reference, decoder):
+    """Restore a return expression only when its entire code unit is proven.
+
+    Structured decompilation can split a conditional value into two returns or
+    leave a short-circuit arm as empty nested if statements. Reuse the existing
+    tests and values; never infer a missing literal, call or business predicate.
+    """
+    try:
+        from .bytecode_fidelity import compare, compile_source, units
+    except ImportError:
+        from bytecode_fidelity import compare, compile_source, units
+
+    class Definitions(ast.NodeVisitor):
+        def __init__(self):
+            self.prefix = ''
+            self.nodes = defaultdict(list)
+        def visit_ClassDef(self, node):
+            old = self.prefix
+            self.prefix += node.name + '.'
+            self.generic_visit(node)
+            self.prefix = old
+        def visit_FunctionDef(self, node):
+            name = self.prefix + node.name
+            self.nodes[name].append(node)
+            old = self.prefix
+            self.prefix = name + '.<locals>.'
+            self.generic_visit(node)
+            self.prefix = old
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+    def check():
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', SyntaxWarning)
+            candidate = compile_source(ast.unparse(ast.fix_missing_locations(tree)),
+                                       '<compound-return-candidate>')
+        return candidate, compare(reference, candidate, decoder)
+
+    def replacement(body, shape):
+        if (len(body) < 2 or not isinstance(body[-1], ast.Return)
+                or not isinstance(body[-2], ast.If)):
+            return None
+        branch, tail = body[-2:]
+        if branch.orelse:
+            return None
+        value = tail.value or ast.Constant(None)
+        if shape == 'conditional':
+            if len(branch.body) != 1 or not isinstance(branch.body[0], ast.Return):
+                return None
+            return ast.Return(ast.IfExp(branch.test, branch.body[0].value or ast.Constant(None), value))
+        conditions = []
+        node = branch
+        while isinstance(node, ast.If) and not node.orelse and len(node.body) == 1:
+            conditions.append(node.test)
+            node = node.body[0]
+        if not conditions or not isinstance(node, ast.Pass):
+            return None
+        condition = conditions[0] if len(conditions) == 1 else ast.BoolOp(ast.And(), conditions)
+        values = [condition] + (value.values if isinstance(value, ast.BoolOp)
+                                and isinstance(value.op, ast.Or) else [value])
+        return ast.Return(ast.BoolOp(ast.Or(), values))
+
+    accepted = []
+    for shape in ('conditional', 'or'):
+        candidate, baseline = check()
+        matching = {entry['unit'] for entry in baseline['entries'] if entry['matched']}
+        by_name = defaultdict(list)
+        for path, code in units(candidate):
+            by_name[code.co_qualname].append((path, code))
+        definitions = Definitions()
+        definitions.visit(tree)
+        attempted = {}
+        for name, nodes in definitions.nodes.items():
+            if len(nodes) != 1 or len(by_name[name]) != 1:
+                continue
+            path, code = by_name[name][0]
+            if path in matching or code.co_flags & 0x200:
+                continue
+            node = nodes[0]
+            statement = replacement(node.body, shape)
+            if statement is None:
+                continue
+            original = node.body[-2:]
+            node.body[-2:] = [statement]
+            attempted[path] = (node, original)
+        if not attempted:
+            continue
+        _, tentative = check()
+        tested = {entry['unit'] for entry in tentative['entries'] if entry['matched']}
+        selected = {}
+        for path, (node, original) in attempted.items():
+            if path in tested:
+                selected[path] = (node, original)
+            else:
+                node.body[-1:] = original
+        _, final = check()
+        after = {entry['unit'] for entry in final['entries'] if entry['matched']}
+        if not matching.issubset(after) or not set(selected).issubset(after):
+            for node, original in selected.values():
+                node.body[-1:] = original
+        else:
+            accepted.extend({'unit': path, 'shape': shape} for path in sorted(selected))
+    return tree, accepted
+
+
 def restore_try_return_scope(tree, reference, decoder):
     """Restore a hoisted final return only after exact exception-dispatch proof."""
     try:
@@ -949,6 +1053,7 @@ def recover(sequence: Path, backend: Path) -> dict:
         tree, report['verified_shared_return_shapes'] = preserve_shared_returns(tree, code, transformer)
         tree, report['verified_try_return_scopes'] = restore_try_return_scope(tree, code, transformer)
         tree, report['verified_capture_name_order'] = restore_capture_name_order(tree, code, transformer)
+        tree, report['verified_compound_return_shapes'] = restore_compound_return_shapes(tree, code, transformer)
         source = ast.unparse(tree) + '\n'
         if report['verified_shared_return_shapes']:
             lines = []
