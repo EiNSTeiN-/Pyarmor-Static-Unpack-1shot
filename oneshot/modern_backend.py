@@ -849,7 +849,10 @@ def _prove_function_trials(tree, reference, decoder, trials):
     def compiled():
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', SyntaxWarning)
-            return compile_source(ast.unparse(ast.fix_missing_locations(tree)), '<shape-trial>')
+            # Compilation accepts an AST directly. Retain its scope and
+            # location context rather than repeatedly unparsing an unchanged
+            # large module for each bounded trial. Proof rules are identical.
+            return compile_source(ast.fix_missing_locations(tree), '<shape-trial>')
 
     initial = compiled()
     before = {entry['unit'] for entry in compare(reference, initial, decoder)['entries'] if entry['matched']}
@@ -1114,6 +1117,213 @@ def restore_coupled_statement_shapes(tree, reference, decoder):
                 trial = copy.deepcopy(clone)
                 _fold_return_statements(trial, depth)
                 yield f'{label}-all-statement-return-fold-{depth}', trial.body
+    return _prove_function_trials(tree, reference, decoder, trials)
+
+
+
+def restore_residual_statement_shapes(tree, reference, decoder):
+    """Prove coupled handler, predicate and terminal shapes from existing work.
+
+    No business expression or exception type is invented. Structural trials
+    reuse each scope's AST, while constant return edges and implicit None only
+    retain compiler control-flow forms. A complete owner/child comparison and
+    the final module retention gate arbitrate every bounded trial.
+    """
+    def same_handlers(region):
+        if not isinstance(region, ast.Try) or not region.handlers or region.orelse or region.finalbody:
+            return None
+        return ast.dump(ast.Module(body=region.handlers, type_ignores=[]))
+
+    def handler_continues(owner):
+        loop_owned = {id(node) for loop in _function_nodes(owner)
+                      if isinstance(loop, (ast.For, ast.AsyncFor, ast.While))
+                      for node in _function_nodes(loop)}
+        handlers = [node for node in _function_nodes(owner)
+                    if isinstance(node, ast.ExceptHandler) and id(node) in loop_owned
+                    and node.body and not isinstance(node.body[-1],
+                        (ast.Return, ast.Raise, ast.Break, ast.Continue))]
+        if len(handlers) > 4:
+            return
+        for mask in range(1, 1 << len(handlers)):
+            trial = copy.deepcopy(owner)
+            all_handlers = [node for node in _function_nodes(trial) if isinstance(node, ast.ExceptHandler)]
+            original_handlers = [node for node in _function_nodes(owner) if isinstance(node, ast.ExceptHandler)]
+            for index, handler in enumerate(handlers):
+                if mask & (1 << index):
+                    all_handlers[original_handlers.index(handler)].body.append(ast.Continue())
+            yield mask, trial
+
+    def shapes(owner):
+        # Reunite all adjacent fragments with identical lexical handlers.
+        # Existing independently authored tries are protected by full proof.
+        merged = copy.deepcopy(owner)
+        changed = False
+        for _, _, suite in reversed(list(_statement_suites(merged))):
+            index = len(suite) - 1
+            while index > 0:
+                key = same_handlers(suite[index])
+                if key is not None and key == same_handlers(suite[index - 1]):
+                    suite[index - 1].body.extend(suite[index].body)
+                    del suite[index]
+                    changed = True
+                index -= 1
+        if changed:
+            yield 'merged-handler-fragments', merged
+            for mask, trial in handler_continues(merged):
+                yield f'merged-handler-loop-continue-{mask}', trial
+            if len(merged.body) > 1 and isinstance(merged.body[-1], ast.Return) and isinstance(merged.body[-2], ast.Try):
+                trial = copy.deepcopy(merged)
+                trial.body[-2].body.append(trial.body.pop())
+                yield 'merged-handler-protected-return', trial
+            trial = copy.deepcopy(merged)
+            removed = False
+            for _, _, suite in _statement_suites(trial):
+                for statement in suite:
+                    if isinstance(statement, ast.Try) and statement.body and isinstance(statement.body[-1], ast.Return) and statement.body[-1].value is None:
+                        statement.body.pop()
+                        statement.body = statement.body or [ast.Pass()]
+                        removed = True
+            if removed:
+                yield 'merged-handler-without-bare-exit', trial
+
+        for suite_index, (parent, field, suite) in enumerate(_statement_suites(owner)):
+            for index, statement in enumerate(suite):
+                if isinstance(statement, ast.Try):
+                    if (same_handlers(statement) is not None and index + 2 < len(suite)
+                            and same_handlers(suite[index + 1]) is not None
+                            and isinstance(suite[index + 2], ast.Return)
+                            and len(statement.handlers) == len(suite[index + 1].handlers)):
+                        returned = suite[index + 2]
+                        pairs = zip(statement.handlers, suite[index + 1].handlers)
+                        missing_terminal = all(
+                            (ast.dump(first.type) if first.type is not None else None)
+                                == (ast.dump(second.type) if second.type is not None else None)
+                            and first.name == second.name
+                            and first.body and isinstance(first.body[-1], ast.Return)
+                            and ast.dump(first.body[-1]) == ast.dump(returned)
+                            and ast.dump(ast.Module(body=first.body[:-1], type_ignores=[]))
+                                == ast.dump(ast.Module(body=second.body, type_ignores=[]))
+                            for first, second in pairs)
+                        if missing_terminal:
+                            trial = copy.deepcopy(owner)
+                            target, name, block = list(_statement_suites(trial))[suite_index]
+                            region = block[index]
+                            region.body.extend(block[index + 1].body)
+                            region.body.append(block[index + 2])
+                            setattr(target, name, block[:index + 1] + block[index + 3:])
+                            yield 'handler-prefix-with-existing-terminal-return', trial
+                    if (statement.handlers and not statement.finalbody and not statement.orelse
+                            and index + 1 < len(suite) and isinstance(suite[index + 1], ast.Return)):
+                        trial = copy.deepcopy(owner)
+                        target, name, block = list(_statement_suites(trial))[suite_index]
+                        region, returned = block[index], block[index + 1]
+                        region.body = [node for node in region.body if not isinstance(node, ast.Pass)] + [copy.deepcopy(returned)]
+                        for handler in region.handlers:
+                            handler.body = [node for node in handler.body if not isinstance(node, ast.Pass)] + [copy.deepcopy(returned)]
+                        setattr(target, name, block[:index + 1] + block[index + 2:])
+                        yield 'try-and-handler-result-return', trial
+                    if (statement.orelse and not statement.finalbody and statement.handlers
+                            and all(handler.body and isinstance(handler.body[-1], (ast.Return, ast.Raise)) for handler in statement.handlers)):
+                        trial = copy.deepcopy(owner)
+                        target, name, block = list(_statement_suites(trial))[suite_index]
+                        region = block[index]
+                        suffix = region.orelse
+                        region.orelse = []
+                        setattr(target, name, block[:index + 1] + suffix + block[index + 1:])
+                        yield 'exiting-handler-success-suffix', trial
+                    if (not statement.orelse and not statement.finalbody
+                            and all(isinstance(node, ast.Pass) for node in statement.body)
+                            and all(all(isinstance(node, ast.Pass) for node in handler.body) for handler in statement.handlers)):
+                        trial = copy.deepcopy(owner)
+                        target, name, block = list(_statement_suites(trial))[suite_index]
+                        setattr(target, name, block[:index] + block[index + 1:] or [ast.Pass()])
+                        yield 'empty-handler-artifact', trial
+                if not isinstance(statement, ast.If) or statement.orelse:
+                    continue
+                # Lost positive predicates can precede their rejection guard
+                # or the conditional value assignment they used to constrain.
+                end = index
+                predicates = []
+                while end < len(suite) and isinstance(suite[end], ast.If) and not suite[end].orelse and len(suite[end].body) == 1 and isinstance(suite[end].body[0], ast.Pass):
+                    predicates.append(suite[end].test)
+                    end += 1
+                if predicates and end < len(suite):
+                    following = suite[end]
+                    if isinstance(following, ast.If) and not following.orelse:
+                        trial = copy.deepcopy(owner)
+                        target, name, block = list(_statement_suites(trial))[suite_index]
+                        branch = block[end]
+                        branch.test = ast.BoolOp(ast.Or(), [ast.UnaryOp(ast.Not(), copy.deepcopy(test)) for test in predicates] + [branch.test])
+                        setattr(target, name, block[:index] + [branch] + block[end + 1:])
+                        yield 'empty-positive-rejection-prefix', trial
+                    if isinstance(following, (ast.Assign, ast.AnnAssign)) and isinstance(following.value, ast.IfExp):
+                        trial = copy.deepcopy(owner)
+                        target, name, block = list(_statement_suites(trial))[suite_index]
+                        assignment = block[end]
+                        assignment.value.test = ast.BoolOp(ast.And(), copy.deepcopy(predicates) + [assignment.value.test])
+                        setattr(target, name, block[:index] + [assignment] + block[end + 1:])
+                        yield 'empty-positive-conditional-value', trial
+                if len(statement.body) == 1 and isinstance(statement.body[0], ast.If):
+                    inner = statement.body[0]
+                    if inner.orelse:
+                        trial = copy.deepcopy(owner)
+                        branch = list(_statement_suites(trial))[suite_index][2][index]
+                        branch.test = ast.BoolOp(ast.And(), [branch.test, branch.body[0].test])
+                        branch.orelse = branch.body[0].orelse
+                        branch.body = branch.body[0].body
+                        yield 'nested-acceptance-with-existing-else', trial
+                    elif inner.body:
+                        # Optional positive filters reject only when supplied
+                        # AND their inner acceptance fails; keep unfiltered work.
+                        trial = copy.deepcopy(owner)
+                        target, name, block = list(_statement_suites(trial))[suite_index]
+                        branch = block[index]
+                        rejection = ast.If(ast.BoolOp(ast.And(), [branch.test, ast.UnaryOp(ast.Not(), branch.body[0].test)]), [ast.Continue()], [])
+                        setattr(target, name, block[:index] + [rejection] + branch.body[0].body + block[index + 1:])
+                        yield 'optional-loop-filter-prefix', trial
+                        # Rebuild the original comparison chain; proving it
+                        # rejects independently evaluated middle expressions.
+                        if (isinstance(statement.test, ast.Compare) and len(statement.test.ops) == 1
+                                and isinstance(inner.test, ast.UnaryOp) and isinstance(inner.test.op, ast.Not)
+                                and isinstance(inner.test.operand, ast.Compare) and len(inner.test.operand.ops) == 1
+                                and ast.dump(statement.test.comparators[0]) == ast.dump(inner.test.operand.left)):
+                            trial = copy.deepcopy(owner)
+                            branch = list(_statement_suites(trial))[suite_index][2][index]
+                            second = branch.body[0].test.operand
+                            chain = ast.Compare(branch.test.left, branch.test.ops + second.ops, branch.test.comparators + second.comparators)
+                            branch.test = ast.UnaryOp(ast.Not(), chain)
+                            branch.body = branch.body[0].body
+                            yield 'original-negated-comparison-chain', trial
+
+        for mask, trial in handler_continues(owner):
+            yield f'existing-loop-handler-continue-{mask}', trial
+
+    def trials(owner, original, candidate):
+        if candidate.co_flags & 0x200:
+            return
+        for label, base in shapes(owner):
+            for fold, tail in ((0, 'none'), (1, 'none'), (2, 'none'),
+                               (0, 'implicit'), (1, 'implicit'),
+                               (0, 'statement'), (1, 'statement')):
+                trial = copy.deepcopy(base)
+                if fold:
+                    for node in _function_nodes(trial):
+                        if isinstance(node, ast.Return): node.value = _fold_value(node.value, fold)
+                if tail == 'implicit': trial.body.append(ast.Return(_fold_value(None, 1)))
+                elif tail == 'statement': trial.body.append(ast.If(ast.Constant(True), [ast.Return()], []))
+                yield f'{label}-fold-{fold}-tail-{tail}', trial.body
+            trial = copy.deepcopy(base)
+            _fold_return_statements(trial, 1)
+            yield label + '-statement-return-edges', trial.body
+        # Some shared exit tails need a single existing bare return wrapped
+        # together with the corresponding implicit statement return outside.
+        returns = [node for node in _function_nodes(owner) if isinstance(node, ast.Return)]
+        for index, returned in enumerate(returns):
+            if returned.value is not None: continue
+            trial = copy.deepcopy(owner)
+            _fold_return_statements(trial, 1, index)
+            trial.body.append(ast.If(ast.Constant(True), [ast.Return()], []))
+            yield f'bare-return-{index}-and-shared-statement-tail', trial.body
     return _prove_function_trials(tree, reference, decoder, trials)
 
 
@@ -1941,6 +2151,7 @@ def recover(sequence: Path, backend: Path) -> dict:
         tree, report['verified_context_boundaries'] = restore_context_boundaries(tree, code, transformer)
         tree, report['verified_coupled_statement_shapes'] = restore_coupled_statement_shapes(tree, code, transformer)
         tree, report['verified_individual_return_edges'] = preserve_individual_return_edges(tree, code, transformer)
+        tree, report['verified_residual_statement_shapes'] = restore_residual_statement_shapes(tree, code, transformer)
         source = ast.unparse(tree) + '\n'
         if report['verified_shared_return_shapes']:
             lines = []

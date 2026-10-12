@@ -422,3 +422,15 @@ order, OR versus AND selection, cancellation cleanup, and async-generator
 normal completion/close/throw. CI pins backend 0.6.16. The independently audited
 application coverage remains recorded by the component's recovery manifests;
 passing these tests alone does not establish a complete recovered application.
+
+
+The 0.4.26 source trials add coupled shared-handler/return reconstruction,
+existing handler-prefix terminal returns, exiting-handler success suffixes,
+empty positive predicate restoration, exact negated comparison chains, and
+reference-proved loop handler continues. Only existing work and compiler return
+shapes are reused. The owner, all descendants and every previous module match
+must still pass the unchanged comparator. Direct AST compilation avoids repeatedly
+unparsing large modules during bounded trials; final emitted source is compared
+separately. Owned tests include true independent tries, meaningful fallthrough,
+duplicate middle calls, wrong handlers and real calls that must be retained.
+Full protected-corpus retention remains a separate publication requirement.

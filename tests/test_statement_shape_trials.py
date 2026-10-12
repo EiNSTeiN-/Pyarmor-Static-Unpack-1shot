@@ -8,7 +8,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'oneshot'))
 from bytecode_fidelity import compare, compile_source
 from modern_backend import (restore_context_boundaries, restore_coupled_statement_shapes,
-                            preserve_individual_return_edges)
+                            preserve_individual_return_edges, restore_residual_statement_shapes)
 
 
 @unittest.skipUnless(sys.version_info[:2] == (3, 14), 'Requires CPython 3.14')
@@ -22,6 +22,301 @@ class StatementShapeTrials(unittest.TestCase):
         for code, namespace in zip((original, rebuilt), namespaces):
             exec(code, namespace)
         return namespaces, tree, selected
+
+
+
+    def test_handler_prefix_merge_restores_missing_existing_result_return(self):
+        source = """def select(read, work, log):
+    try:
+        value = read()
+        if value is None:
+            return False
+        work(value)
+        return False
+    except ValueError:
+        log()
+        return False
+"""
+        candidate = """def select(read, work, log):
+    try:
+        value = read()
+        if value is None:
+            return False
+    except ValueError:
+        log()
+        return False
+    try:
+        work(value)
+    except ValueError:
+        log()
+    return False
+"""
+        namespaces, _, selected = self.repaired(source, candidate, restore_residual_statement_shapes)
+        self.assertTrue(selected)
+        for failure in (None, 'read', 'work'):
+            outcomes = []
+            for namespace in namespaces:
+                events = []
+                def read():
+                    events.append('read')
+                    if failure == 'read': raise ValueError('owned read')
+                    return 7
+                def work(value):
+                    events.append(('work', value))
+                    if failure == 'work': raise ValueError('owned work')
+                def log(): events.append('log')
+                outcomes.append((namespace['select'](read, work, log), events))
+            self.assertEqual(outcomes[1], outcomes[0])
+        wrong = candidate.replace('    except ValueError:\n        log()\n    return False',
+                                  '    except RuntimeError:\n        log()\n    return False')
+        tree, selected = restore_residual_statement_shapes(ast.parse(wrong), compile_source(source, 'owned'), None)
+        self.assertEqual(selected, [])
+
+    def test_handler_continue_retains_error_skip_and_real_fallthrough(self):
+        source = """def select(rows, read):
+    result = []
+    for row in rows:
+        try:
+            value = read(row)
+        except ValueError:
+            value = 0
+            continue
+        result.append(value)
+    return result
+"""
+        candidate = source.replace('            continue\n', '')
+        namespaces, _, selected = self.repaired(source, candidate, restore_residual_statement_shapes)
+        self.assertTrue(selected)
+        outputs = []
+        for namespace in namespaces:
+            events = []
+            def read(value):
+                events.append(value)
+                if value == 2: raise ValueError('owned read')
+                return value
+            outputs.append((namespace['select']([1, 2, 3], read), events))
+        self.assertEqual(outputs[1], outputs[0])
+        self.assertEqual(outputs[1], ([1, 3], [1, 2, 3]))
+        reference = compile_source(candidate, 'real-fallthrough')
+        tree, selected = restore_residual_statement_shapes(ast.parse(candidate), reference, None)
+        self.assertEqual(selected, [])
+        self.assertTrue(compare(reference, compile_source(ast.unparse(tree), 'real-fallthrough'))['all_units_match'])
+
+    def test_result_return_belongs_to_both_try_and_handler(self):
+        source = """def select(call):
+    result = {}
+    try:
+        result['value'] = call()
+        return result
+    except ValueError:
+        result['failed'] = True
+        return result
+"""
+        candidate = """def select(call):
+    result = {}
+    try:
+        result['value'] = call()
+    except ValueError:
+        result['failed'] = True
+    return result
+"""
+        namespaces, _, selected = self.repaired(source, candidate, restore_residual_statement_shapes)
+        self.assertTrue(selected)
+        for failure in (None, ValueError, RuntimeError):
+            outcomes = []
+            for namespace in namespaces:
+                def call():
+                    if failure: raise failure('owned call')
+                    return 7
+                try: value = namespace['select'](call)
+                except RuntimeError as error: value = (type(error).__name__, str(error))
+                outcomes.append(value)
+            self.assertEqual(outcomes[1], outcomes[0])
+
+    def test_adjacent_handler_merge_and_protected_return_retains_real_independent_tries(self):
+        source = """def select(first, second):
+    try:
+        value = first()
+        if value is None:
+            return 0
+        return second(value)
+    except ValueError:
+        return -1
+"""
+        candidate = """def select(first, second):
+    try:
+        value = first()
+        if value is None:
+            return 0
+    except ValueError:
+        return -1
+    try:
+        pass
+    except ValueError:
+        return -1
+    return second(value)
+"""
+        namespaces, _, selected = self.repaired(source, candidate, restore_residual_statement_shapes)
+        self.assertTrue(selected)
+        for value in (None, 0, 4):
+            for failure in (None, 'first', 'second'):
+                outcomes = []
+                for namespace in namespaces:
+                    events = []
+                    def first():
+                        events.append('first')
+                        if failure == 'first': raise ValueError('owned first')
+                        return value
+                    def second(value):
+                        events.append(('second', value))
+                        if failure == 'second': raise ValueError('owned second')
+                        return value + 1
+                    outcomes.append((namespace['select'](first, second), events))
+                self.assertEqual(outcomes[1], outcomes[0])
+        reference = compile_source(candidate, 'independent')
+        tree, selected = restore_residual_statement_shapes(ast.parse(candidate), reference, None)
+        self.assertEqual(selected, [])
+        self.assertTrue(compare(reference, compile_source(ast.unparse(tree), 'independent'))['all_units_match'])
+
+    def test_empty_positive_prefix_restores_rejection_short_circuit(self):
+        source = """def select(rows, first, second, reject):
+    result = []
+    for row in rows:
+        if not first(row) or not second(row) or reject(row):
+            continue
+        result.append(row)
+    return result
+"""
+        candidate = source.replace('if not first(row) or not second(row) or reject(row):',
+            'if first(row):\n            pass\n        if second(row):\n            pass\n        if reject(row):')
+        namespaces, _, selected = self.repaired(source, candidate, restore_residual_statement_shapes)
+        self.assertTrue(selected)
+        for namespace in namespaces:
+            events = []
+            def first(row): events.append(('first', row)); return row != 0
+            def second(row): events.append(('second', row)); return row != 1
+            def reject(row): events.append(('reject', row)); return row == 2
+            actual = namespace['select']([0, 1, 2, 3], first, second, reject)
+            self.assertEqual(actual, [3])
+            self.assertEqual(events, [('first', 0), ('first', 1), ('second', 1),
+                ('first', 2), ('second', 2), ('reject', 2), ('first', 3), ('second', 3), ('reject', 3)])
+
+    def test_empty_positive_prefix_restores_conditional_assignment(self):
+        source = """def select(first, second, value):
+    result = value() if first and second else None
+    return result
+"""
+        candidate = """def select(first, second, value):
+    if first:
+        pass
+    result = value() if second else None
+    return result
+"""
+        namespaces, _, selected = self.repaired(source, candidate, restore_residual_statement_shapes)
+        self.assertTrue(selected)
+        for first in (False, True):
+            for second in (False, True):
+                outputs = []
+                for namespace in namespaces:
+                    events = []
+                    def value(): events.append('value'); return 7
+                    outputs.append((namespace['select'](first, second, value), events))
+                self.assertEqual(outputs[1], outputs[0])
+
+    def test_comparison_chain_restores_middle_value_and_rejects_duplicate_calls(self):
+        source = """def select(hour):
+    if not 0 <= hour <= 23:
+        return None
+    return hour
+"""
+        candidate = """def select(hour):
+    if 0 <= hour:
+        if not hour <= 23:
+            return None
+    return hour
+"""
+        namespaces, _, selected = self.repaired(source, candidate, restore_residual_statement_shapes)
+        self.assertTrue(selected)
+        for hour in (-1, 0, 23, 24):
+            self.assertEqual(namespaces[1]['select'](hour), namespaces[0]['select'](hour))
+        self.assertIsNone(namespaces[1]['select'](float('nan')))
+        independent = """def select(read):
+    if 0 <= read():
+        if not read() <= 23:
+            return None
+    return 7
+"""
+        reference = compile_source(independent, 'independent-calls')
+        tree, selected = restore_residual_statement_shapes(ast.parse(independent), reference, None)
+        self.assertEqual(selected, [])
+        self.assertTrue(compare(reference, compile_source(ast.unparse(tree), 'independent-calls'))['all_units_match'])
+
+    def test_exiting_handler_orelse_hoist_keeps_exception_order(self):
+        source = """def select(read, decode):
+    try:
+        value = read()
+    except ValueError:
+        return None
+    try:
+        return decode(value)
+    except RuntimeError:
+        return False
+"""
+        candidate = """def select(read, decode):
+    try:
+        value = read()
+    except ValueError:
+        return None
+    else:
+        try:
+            return decode(value)
+        except RuntimeError:
+            return False
+"""
+        namespaces, _, selected = self.repaired(source, candidate, restore_residual_statement_shapes)
+        self.assertTrue(selected)
+        for failure in (None, 'read', 'decode'):
+            outputs = []
+            for namespace in namespaces:
+                events = []
+                def read():
+                    events.append('read')
+                    if failure == 'read': raise ValueError('owned read')
+                    return 7
+                def decode(value):
+                    events.append(('decode', value))
+                    if failure == 'decode': raise RuntimeError('owned decode')
+                    return value + 1
+                outputs.append((namespace['select'](read, decode), events))
+            self.assertEqual(outputs[1], outputs[0])
+        falling_through = candidate.replace('return None', 'value = 3')
+        reference = compile_source(falling_through, 'falling-through')
+        tree, selected = restore_residual_statement_shapes(ast.parse(falling_through), reference, None)
+        self.assertEqual(selected, [])
+
+    def test_empty_handler_artifact_respects_existing_match_and_real_calls(self):
+        source = """def select(read):
+    return read()
+"""
+        candidate = """def select(read):
+    try:
+        pass
+    except ValueError:
+        pass
+    return read()
+"""
+        namespaces, _, selected = self.repaired(source, candidate, restore_residual_statement_shapes)
+        # The established comparator already normalizes this inert owned
+        # handler. A matching owner must not be rewritten for a gain claim.
+        self.assertEqual(selected, [])
+        for namespace in namespaces:
+            self.assertEqual(namespace['select'](lambda: 7), 7)
+            with self.assertRaises(ValueError):
+                namespace['select'](lambda: (_ for _ in ()).throw(ValueError('owned call')))
+        real = candidate.replace('        pass\n    except', '        read()\n    except')
+        reference = compile_source(real, 'real-call')
+        tree, selected = restore_residual_statement_shapes(ast.parse(real), reference, None)
+        self.assertEqual(selected, [])
 
     def test_context_closes_before_writes_and_keeps_suppressed_setup_failure(self):
         source = '''async def select(database, required):
