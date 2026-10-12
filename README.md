@@ -31,6 +31,9 @@ The pinned backend also preserves independent for-loop rejection guards, so a
 return cannot escape the guard that assigned its value. Owned bytecode/behavior
 checks include invalid rows, None and false values, getter order and identity
 tests that must not invoke user truth conversion.
+The lookup repair requires an unprotected suite, the assigned local's later
+None guard and a return of that same local. Other guard and handler layouts keep
+their existing handling; broad guard inversion failed corpus-retention checks.
 Negated comparison guards retain their original operator and invert the truth
 jump instead; NaN and user rich comparisons must not be changed by folding
 `not (value < limit)` into `value >= limit`.
