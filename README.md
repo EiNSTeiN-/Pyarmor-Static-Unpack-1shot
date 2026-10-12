@@ -456,3 +456,12 @@ ordered keyword expansions, chained comparisons within comprehension values,
 and constant early-return cleanup in async contexts. Full application coverage
 and zero-loss retention must still be audited separately before either tool is
 advanced to its stable branch.
+
+The 0.4.27 recovery implementation remains unchanged when CI advances its
+native dependency to backend 0.6.20. The complete `open-context-return-01`
+audit compares all 274 native outputs. It reuses source only for the 269
+modules with identical raw output, identical diagnostics, and the same frozen
+source API; five changed modules are regenerated. Every source then receives
+the full original-bytecode audit. Raw and composite views each gain three
+units with no losses, reaching 13,824/14,291 composite matches; 467 units remain.
+All 183 unpacker cases also pass against backend 0.6.20 locally.
