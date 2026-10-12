@@ -174,6 +174,15 @@ lazy closures, coroutine handlers and cancellation. Altered attributes,
 arguments and mixed call shapes remain unproven. Accepted units are listed in
 `verified_attribute_callable_values` in the recovery report.
 
+The callable-value pass also tries one through four constant-folded layers
+around existing returns when an attribute-only trial does not match. Some
+coroutines need both the callable-value lookup and their shared exit block
+restored together; neither isolated change passes full-unit comparison. The
+joint trial reuses existing expressions, keeps every handler significant and
+restores all failed neighboring edits. Owned fixtures verify reconnect versus
+creation, descriptor lookup, argument order, errors, cancellation and nested
+scope isolation. Wrong arguments, receivers or branch conditions still fail.
+
 Python 3.14 may also create a module's conditional-annotation set implicitly.
 An explicit guessed empty dictionary in generated source would overwrite that
 real binding. The source pass removes it only when the entire module unit then

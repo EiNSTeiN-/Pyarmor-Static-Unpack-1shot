@@ -1153,8 +1153,10 @@ def restore_attribute_callable_values(tree, reference, decoder):
     """Preserve callable-value loads only after full unit proof.
 
     A folded condition retains LOAD_ATTR without the method-call optimization.
-    Reuse only existing attribute/argument expressions, and reject any trial
-    that fails unit comparison or loses a previously matched unit.
+    Reuse only existing attribute/argument expressions. Some functions also
+    need their shared return block preserved; try these two shapes together
+    before rejecting either. Every accepted trial must match the full unit
+    and retain every previously matched unit.
     """
     try:
         from .bytecode_fidelity import canonical, compare, compile_source, units
@@ -1184,7 +1186,13 @@ def restore_attribute_callable_values(tree, reference, decoder):
             if isinstance(child, scopes): continue
             if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute): yield child
             yield from direct_calls(child)
+    def direct_returns(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, scopes): continue
+            if isinstance(child, ast.Return): yield child
+            else: yield from direct_returns(child)
     attempted = {}
+    return_edits = {}
     for path, code in candidates.items():
         if path in matching or path not in references: continue
         scope_nodes = nodes[code.co_name, code.co_firstlineno]
@@ -1203,20 +1211,49 @@ def restore_attribute_callable_values(tree, reference, decoder):
             previous = call.func
             call.func = ast.IfExp(ast.Constant(True), previous, ast.Constant(None))
             edits.append((call, previous))
-        if edits: attempted[path] = edits
+        if edits:
+            attempted[path] = edits
+            if not code.co_flags & 0x200:
+                return_edits[path] = [(statement, statement.value)
+                                      for statement in direct_returns(scope_nodes[0])]
     if not attempted: return tree, []
     _, tentative = checked()
     proved = {e['unit'] for e in tentative['entries'] if e['matched']}
     selected = {}
     for path, edits in attempted.items():
         if path in proved: selected[path] = edits
-        else:
+    folded_returns = {}
+    # Attribute-only and return-only changes can both fail while their joint
+    # shape matches. Keep the callable trial in place for this bounded search;
+    # each failed return trial is restored before trying the next depth.
+    for depth in range(1, 5):
+        pending = {path: edits for path, edits in return_edits.items()
+                   if path not in selected and edits}
+        if not pending: break
+        for edits in pending.values():
+            for statement, previous in edits:
+                value = previous if previous is not None else ast.Constant(None)
+                for _ in range(depth):
+                    value = ast.IfExp(ast.Constant(True), value, ast.Constant(None))
+                statement.value = value
+        _, tentative = checked()
+        proved = {e['unit'] for e in tentative['entries'] if e['matched']}
+        for path, edits in pending.items():
+            if path in proved:
+                selected[path] = attempted[path]
+                folded_returns[path] = edits
+            else:
+                for statement, previous in edits: statement.value = previous
+    for path, edits in attempted.items():
+        if path not in selected:
             for call, previous in edits: call.func = previous
     _, final = checked()
     after = {e['unit'] for e in final['entries'] if e['matched']}
     if not matching.issubset(after) or not set(selected).issubset(after):
         for edits in selected.values():
             for call, previous in edits: call.func = previous
+        for edits in folded_returns.values():
+            for statement, previous in edits: statement.value = previous
         return tree, []
     return tree, sorted(after-matching)
 
