@@ -496,3 +496,20 @@ order, guarded date/timer parsing, clamping errors, optional-query faults and
 context exits. All 192 unpacker cases pass locally, with one existing expected failure.
 The full application zero-loss audit remains required before publication or
 promotion of this development version; comparator rules remain unchanged.
+
+Version 0.4.29 development adds bounded accepting loop payload and handler
+fragment trials. A rejecting continue form can match instructions while
+changing protected-range gaps; the original accepting scope is selected only
+by complete instruction and exception proof. Existing predicates and work
+are reused. Rich comparisons keep their actual operators, including NaN
+behavior. Short coupled guards are bounded; nested loops keep their own
+continuations. A pass-only trailing handler can be tested as a fragment of an
+existing handler, coupled with its original timer guard and final result.
+Owner headers/docstrings are preserved, genuine independent handlers remain
+separate, and the final module gate protects all previous matches.
+
+Eight owned methods test these repairs and negative controls. All 200 unpacker
+cases pass locally with one existing expected failure. The workflow pins
+native 0.6.22, whose full 274-module corpus gate gains 11 raw/10 composite
+units with zero losses. Development 0.4.29 still requires its own full corpus
+retention audit before promotion. No comparison rule is relaxed.

@@ -1452,6 +1452,130 @@ def restore_shared_guard_shapes(tree, reference, decoder):
     return _prove_function_trials(tree, reference, decoder, trials)
 
 
+def restore_payload_and_handler_shapes(tree, reference, decoder):
+    """Prove accepting loop payloads and bounded handler-fragment reunion.
+
+    Equivalent continue spelling can change protected-range gaps. Preserve
+    every existing predicate, payload and owner header, then require complete
+    instruction/exception proof. A pass-only handler is merely a candidate
+    fragment; its lexical similarity never establishes shared ownership.
+    """
+    def accepting(test, comparison_form):
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            return copy.deepcopy(test.operand)
+        if isinstance(test, ast.BoolOp):
+            operation = ast.Or() if isinstance(test.op, ast.And) else ast.And()
+            return ast.BoolOp(operation,
+                [accepting(value, comparison_form) for value in test.values])
+        inverse = {ast.Eq: ast.NotEq, ast.NotEq: ast.Eq, ast.Is: ast.IsNot,
+                   ast.IsNot: ast.Is, ast.In: ast.NotIn, ast.NotIn: ast.In}
+        if (comparison_form and isinstance(test, ast.Compare) and len(test.ops) == 1
+                and type(test.ops[0]) in inverse):
+            return ast.Compare(copy.deepcopy(test.left),
+                [inverse[type(test.ops[0])]()], copy.deepcopy(test.comparators))
+        return ast.UnaryOp(ast.Not(), copy.deepcopy(test))
+
+    def payload_shapes(owner):
+        loops = [node for node in _function_nodes(owner)
+                 if isinstance(node, (ast.For, ast.AsyncFor, ast.While))]
+        loop_owned = {id(node) for loop in loops for node in (loop, *_function_nodes(loop))}
+        sites = [(suite_index, index)
+                 for suite_index, (parent, field, suite) in enumerate(_statement_suites(owner))
+                 if id(parent) in loop_owned and not (parent in loops and field == 'orelse')
+                 for index, statement in enumerate(suite[:-1])
+                 if isinstance(statement, ast.If) and not statement.orelse
+                 and len(statement.body) == 1 and isinstance(statement.body[0], ast.Continue)]
+        # A short set can require coupled repairs. Larger sets retain bounded
+        # individual trials; no unbounded combinatorial search is introduced.
+        selections = ([tuple(index for index in range(len(sites)) if mask & (1 << index))
+                       for mask in range(1, 1 << len(sites))]
+                      if len(sites) <= 4 else [(index,) for index in range(min(len(sites), 8))])
+        for selected in selections:
+            for comparison_form in (False, True):
+                clone = copy.deepcopy(owner)
+                suites = list(_statement_suites(clone))
+                # Keep original node/list identities while an enclosing guard
+                # takes ownership of a suffix containing another selected site.
+                for site_index in sorted(selected, key=lambda index: sites[index], reverse=True):
+                    suite_index, index = sites[site_index]
+                    parent, field, _ = suites[suite_index]
+                    suite = getattr(parent, field)
+                    branch = suite[index]
+                    branch.test = accepting(branch.test, comparison_form)
+                    branch.body = suite[index + 1:]
+                    setattr(parent, field, suite[:index + 1])
+                yield f'accepting-loop-payload-{selected}-{comparison_form}', clone
+
+    def handler_shapes(owner):
+        for suite_index, (_, _, suite) in enumerate(_statement_suites(owner)):
+            for index, first in enumerate(suite[:-1]):
+                if (not isinstance(first, ast.Try) or not first.handlers
+                        or first.orelse or first.finalbody):
+                    continue
+                key = ast.dump(ast.Module(body=first.handlers, type_ignores=[]))
+                stop = index + 1
+                while stop < len(suite) and stop - index < 8:
+                    region = suite[stop]
+                    if (not isinstance(region, ast.Try) or not region.handlers
+                            or region.orelse or region.finalbody):
+                        break
+                    identical = ast.dump(ast.Module(body=region.handlers, type_ignores=[])) == key
+                    pass_alias = (len(region.handlers) == len(first.handlers)
+                        and all(all(isinstance(node, ast.Pass) for node in later.body)
+                            and (ast.dump(earlier.type) if earlier.type is not None else None)
+                                == (ast.dump(later.type) if later.type is not None else None)
+                            for earlier, later in zip(first.handlers, region.handlers)))
+                    if not identical and not pass_alias:
+                        break
+                    stop += 1
+                    clone = copy.deepcopy(owner)
+                    target, field, block = list(_statement_suites(clone))[suite_index]
+                    merged = block[index]
+                    merged.body = [statement for fragment in block[index:stop]
+                                   for statement in fragment.body if not isinstance(statement, ast.Pass)] or [ast.Pass()]
+                    setattr(target, field, block[:index + 1] + block[stop:])
+                    yield 'reunited-handler-fragments', clone
+                    if stop < len(block) and isinstance(block[stop], ast.Return):
+                        returned = copy.deepcopy(clone)
+                        parent, name, statements = list(_statement_suites(returned))[suite_index]
+                        statements[index].body.append(statements[index + 1])
+                        setattr(parent, name, statements[:index + 1] + statements[index + 2:])
+                        yield 'reunited-handler-and-existing-result', returned
+                    # Existing empty guards and optional handlers may have
+                    # lost their shared scope in the same fragmented region.
+                    guarded = copy.deepcopy(clone)
+                    changed = False
+                    for parent, name, statements in reversed(list(_statement_suites(guarded))):
+                        updated = list(statements)
+                        for offset in range(len(updated) - 2, -1, -1):
+                            guard, following = updated[offset:offset + 2]
+                            if (isinstance(guard, ast.If) and not guard.orelse
+                                    and all(isinstance(node, ast.Pass) for node in guard.body)
+                                    and isinstance(following, ast.Try) and not following.finalbody
+                                    and not following.orelse):
+                                guard.body = [following]
+                                del updated[offset + 1]
+                                changed = True
+                        setattr(parent, name, updated)
+                    if changed:
+                        yield 'reunited-handler-and-guarded-existing-work', guarded
+                        if stop < len(block) and isinstance(block[stop], ast.Return):
+                            parent, name, statements = list(_statement_suites(guarded))[suite_index]
+                            statements[index].body.append(statements[index + 1])
+                            setattr(parent, name, statements[:index + 1] + statements[index + 2:])
+                            yield 'reunited-handler-guard-and-existing-result', guarded
+                    if pass_alias and not identical:
+                        break
+
+    def trials(owner, original, candidate):
+        yield from ((label, clone.body) for label, clone in payload_shapes(owner))
+        for label, clone in handler_shapes(owner):
+            yield label, clone.body
+            for payload_label, payload in payload_shapes(clone):
+                yield label + '-' + payload_label, payload.body
+    return _prove_function_trials(tree, reference, decoder, trials)
+
+
 def restore_substantive_value_shapes(tree, reference, decoder):
     """Recover existing operands and bindings only with full subtree proof.
 
@@ -2401,6 +2525,7 @@ def recover(sequence: Path, backend: Path) -> dict:
         tree, report['verified_residual_statement_shapes'] = restore_residual_statement_shapes(tree, code, transformer)
         tree, report['verified_substantive_value_shapes'] = restore_substantive_value_shapes(tree, code, transformer)
         tree, report['verified_shared_guard_shapes'] = restore_shared_guard_shapes(tree, code, transformer)
+        tree, report['verified_payload_and_handler_shapes'] = restore_payload_and_handler_shapes(tree, code, transformer)
         source = ast.unparse(tree) + '\n'
         if report['verified_shared_return_shapes']:
             lines = []
