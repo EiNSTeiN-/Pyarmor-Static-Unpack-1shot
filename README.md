@@ -111,6 +111,14 @@ hooks, closures, generators and coroutines and reject different constants,
 parameters and handler types. The recovery report lists exactly the accepted
 unit paths in `verified_shared_return_shapes`.
 
+Python 3.14 may also create a module's conditional-annotation set implicitly.
+An explicit guessed empty dictionary in generated source would overwrite that
+real binding. The source pass removes it only when the entire module unit then
+matches and no earlier unit match is lost. Actual namespace stores remain
+significant in the verifier. Owned tests compare the compiler set, annotation
+dictionary and other exported bindings and keep genuine explicit assignments.
+The recovery report records `verified_module_annotation_binding`.
+
 Run the original-fixture regression tests with:
 
 ```bash

@@ -569,6 +569,49 @@ class FutureAnnotationNormalizer(ast.NodeTransformer):
         return self.generic_visit(node)
 
 
+def restore_module_annotation_binding(tree, reference, decoder):
+    """Remove a duplicate guessed map only after the module unit matches.
+
+    Python 3.14 creates the module's conditional-annotation set implicitly.
+    Rendering that setup as an explicit empty dict overwrites its real binding.
+    Recompilation must recreate the exact set setup and all namespace stores;
+    this pass never ignores the binding in bytecode comparison.
+    """
+    if reference.co_name != '<module>':
+        return tree, False
+    candidates = [statement for statement in tree.body
+                  if isinstance(statement, ast.Assign) and len(statement.targets) == 1
+                  and isinstance(statement.targets[0], ast.Name)
+                  and statement.targets[0].id == '__conditional_annotations__'
+                  and isinstance(statement.value, ast.Dict) and not statement.value.keys]
+    if not candidates:
+        return tree, False
+    try:
+        from .bytecode_fidelity import compare, compile_source
+    except ImportError:
+        from bytecode_fidelity import compare, compile_source
+
+    def report():
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', SyntaxWarning)
+            candidate = compile_source(ast.unparse(tree), '<static-module-candidate>')
+        return compare(reference, candidate, decoder)
+
+    before = report()
+    if before['entries'][0]['matched']:
+        return tree, False
+    matched_before = {entry['unit'] for entry in before['entries'] if entry['matched']}
+    for statement in candidates:
+        index = tree.body.index(statement)
+        tree.body.pop(index)
+        after = report()
+        matched_after = {entry['unit'] for entry in after['entries'] if entry['matched']}
+        if after['entries'][0]['matched'] and matched_before.issubset(matched_after):
+            return tree, True
+        tree.body.insert(index, statement)
+    return tree, False
+
+
 def preserve_shared_returns(tree, reference, decoder):
     """Retain a compiler shared-return shape only after exact unit proof.
 
@@ -689,6 +732,7 @@ def recover(sequence: Path, backend: Path) -> dict:
                and any(alias.name == 'annotations' for alias in statement.names)
                for statement in tree.body):
             tree = ast.fix_missing_locations(FutureAnnotationNormalizer().visit(tree))
+        tree, report['verified_module_annotation_binding'] = restore_module_annotation_binding(tree, code, transformer)
         tree, report['verified_shared_return_shapes'] = preserve_shared_returns(tree, code, transformer)
         source = ast.unparse(tree) + '\n'
         if report['verified_shared_return_shapes']:
