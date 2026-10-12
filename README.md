@@ -128,6 +128,10 @@ range, target, stack depth and lasti flag. It rejects unproven changes and
 checks that no old match is lost. Existing outside returns and finally suites
 are preserved. Owned fixtures exercise handled access/conversion errors and
 coroutine cancellation. Accepted paths appear in `verified_try_return_scopes`.
+The same proof-gated trial covers empty try bodies whose handlers were optimized
+away after the return was hoisted. These cases can initially fail instruction
+comparison; they still require a full code-unit match after repair. Owned
+fixtures retain handled missing attributes and unhandled property failures.
 
 Run the original-fixture regression tests with:
 

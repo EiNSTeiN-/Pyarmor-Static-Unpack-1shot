@@ -128,3 +128,44 @@ class TryReturnScopeTests(unittest.TestCase):
         original, recovered, _, selected = self.recover(source, source)
         self.assertEqual(selected, [])
         self.assertTrue(compare(original, recovered)['all_units_match'])
+
+    def test_empty_try_retains_fallible_attribute_lookup_in_original_handler(self):
+        reference = '''def read(value):
+    try:
+        return value.active
+    except AttributeError:
+        return False
+'''
+        candidate = '''def read(value):
+    try:
+        pass
+    except AttributeError:
+        return False
+    return value.active
+'''
+        original, recovered, tree, selected = self.recover(reference, candidate)
+        self.assertEqual(selected, ['<module>/read#1'])
+        self.assertTrue(compare(original, recovered)['all_units_match'])
+        namespaces = [{}, {}]
+        exec(original, namespaces[0]); exec(recovered, namespaces[1])
+
+        class Value:
+            def __init__(self, mode):
+                self.mode = mode
+            @property
+            def active(self):
+                if self.mode == 'missing':
+                    raise AttributeError('owned missing telemetry')
+                if self.mode == 'unhandled':
+                    raise ValueError('owned unhandled failure')
+                return self.mode
+
+        for mode in (True, False, 'missing', 'unhandled'):
+            outputs = []
+            for namespace in namespaces:
+                try:
+                    outputs.append(namespace['read'](Value(mode)))
+                except ValueError as error:
+                    outputs.append((type(error).__name__, str(error)))
+            self.assertEqual(outputs[1], outputs[0])
+        self.assertEqual(restore_try_return_scope(tree, original, None)[1], [])

@@ -645,7 +645,11 @@ def restore_try_return_scope(tree, reference, decoder):
 
     candidate, before = check()
     matched_before = {entry['unit'] for entry in before['entries'] if entry['matched']}
-    failed = {entry['unit'] for entry in before['entries'] if entry['reason'] == 'exception_table'}
+    # A hoisted return can leave only ``pass`` in the try body. CPython may
+    # optimize that handler away, so these cases also fail instruction proof.
+    # The tentative repair still needs full unit proof and preserves old matches.
+    failed = {entry['unit'] for entry in before['entries']
+              if entry['reason'] in ('exception_table', 'instructions')}
     if not failed:
         return tree, []
     by_name = defaultdict(list)
