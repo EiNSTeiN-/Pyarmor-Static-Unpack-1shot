@@ -434,3 +434,25 @@ unparsing large modules during bounded trials; final emitted source is compared
 separately. Owned tests include true independent tries, meaningful fallthrough,
 duplicate middle calls, wrong handlers and real calls that must be retained.
 Full protected-corpus retention remains a separate publication requirement.
+
+### Existing value and binding reconstruction
+
+Version 0.4.27 restores lost inplace assignment operators, singleton tuple
+boundaries around optional expanded rows, carried container return values,
+top-package bindings for unaliased dotted imports, and compound conditional
+values. Generator filters incorrectly paired with OR may be restored as
+consecutive conjunctive filters. These are bounded trials over existing
+expressions; a genuine assignment, expansion, alias, discarded container or
+disjunction remains unchanged unless the original complete subtree proves the
+replacement. An already matching function may still need its generator child
+repaired, so trial eligibility checks the whole descendant set.
+
+The seven new owned tests cover single target evaluation and mutable identity,
+empty and populated expansions, handler boundaries and call order, import
+binding, short-circuit predicates, nested captures, and meaningful negative
+controls. All 183 unpacker cases pass, including one existing expected failure.
+CI pins backend 0.6.19, whose independently tested native changes preserve
+ordered keyword expansions, chained comparisons within comprehension values,
+and constant early-return cleanup in async contexts. Full application coverage
+and zero-loss retention must still be audited separately before either tool is
+advanced to its stable branch.

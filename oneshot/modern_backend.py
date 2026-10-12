@@ -867,7 +867,8 @@ def _prove_function_trials(tree, reference, decoder, trials):
     settled = set(before)
     for path, code in units(initial):
         owners = definitions[code.co_name, code.co_firstlineno]
-        if path in settled or path not in references or len(owners) != 1:
+        subtree = {unit_path for unit_path, _ in units(references[path], path)} if path in references else set()
+        if subtree.issubset(settled) or path not in references or len(owners) != 1:
             continue
         owner = owners[0]
         original_body = owner.body
@@ -1324,6 +1325,128 @@ def restore_residual_statement_shapes(tree, reference, decoder):
             _fold_return_statements(trial, 1, index)
             trial.body.append(ast.If(ast.Constant(True), [ast.Return()], []))
             yield f'bare-return-{index}-and-shared-statement-tail', trial.body
+    return _prove_function_trials(tree, reference, decoder, trials)
+
+
+def restore_substantive_value_shapes(tree, reference, decoder):
+    """Recover existing operands and bindings only with full subtree proof.
+
+    Assignment operators, singleton expansion boundaries, returned values and
+    dotted-import bindings are observable behavior, not formatting. Each trial
+    keeps the existing expressions and is rejected unless the complete owner,
+    descendants, exception coverage and prior module matches are retained.
+    """
+    def inplace(owner):
+        changed = False
+        for parent, field, suite in _statement_suites(owner):
+            updated = []
+            for statement in suite:
+                if (isinstance(statement, ast.Assign) and len(statement.targets) == 1
+                        and isinstance(statement.value, ast.BinOp)):
+                    target = copy.deepcopy(statement.targets[0])
+                    if isinstance(target, (ast.Name, ast.Attribute, ast.Subscript)):
+                        target.ctx = ast.Load()
+                        if ast.dump(target) == ast.dump(statement.value.left):
+                            updated.append(ast.AugAssign(copy.deepcopy(statement.targets[0]),
+                                statement.value.op, statement.value.right))
+                            changed = True
+                            continue
+                updated.append(statement)
+            setattr(parent, field, updated)
+        return changed
+
+    def singleton_expansions(owner):
+        changed = False
+        for node in _function_nodes(owner):
+            if (isinstance(node, ast.Starred) and isinstance(node.value, ast.IfExp)
+                    and isinstance(node.value.body, ast.Tuple) and node.value.body.elts
+                    and isinstance(node.value.orelse, ast.Tuple) and not node.value.orelse.elts):
+                node.value.body = ast.Tuple([node.value.body], ast.Load())
+                changed = True
+        return changed
+
+    def carried_results(owner):
+        changed = False
+        for parent, field, suite in reversed(list(_statement_suites(owner))):
+            updated, index = [], 0
+            while index < len(suite):
+                statement = suite[index]
+                if (isinstance(statement, ast.Expr)
+                        and isinstance(statement.value, (ast.Dict, ast.List, ast.Tuple))
+                        and index + 1 < len(suite) and isinstance(suite[index + 1], ast.Return)
+                        and suite[index + 1].value is None):
+                    updated.append(ast.Return(statement.value))
+                    index += 2
+                    changed = True
+                else:
+                    updated.append(statement)
+                    index += 1
+            setattr(parent, field, updated)
+        return changed
+
+    def dotted_imports(owner):
+        renamed = {}
+        for node in _function_nodes(owner):
+            if isinstance(node, ast.Import) and len(node.names) == 1:
+                alias = node.names[0]
+                root = alias.name.split('.')[0]
+                if '.' in alias.name and alias.asname and alias.asname != root:
+                    renamed[alias.asname] = root
+                    alias.asname = None
+        if not renamed:
+            return False
+        for node in _function_nodes(owner):
+            if isinstance(node, ast.Name) and node.id in renamed:
+                node.id = renamed[node.id]
+        return True
+
+    def conditional_values(owner):
+        changed = False
+        for node in _function_nodes(owner):
+            if isinstance(node, ast.IfExp) and isinstance(node.orelse, ast.IfExp):
+                inner = node.orelse
+                node.test = ast.BoolOp(ast.And(), [node.test, inner.test])
+                node.body, node.orelse = inner.body, inner.orelse
+                changed = True
+        return changed
+
+    def conjunctive_filters(owner):
+        changed = False
+        def visit(node):
+            nonlocal changed
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                    continue
+                if isinstance(child, ast.comprehension):
+                    filters = []
+                    for condition in child.ifs:
+                        if isinstance(condition, ast.BoolOp) and isinstance(condition.op, ast.Or):
+                            filters.extend(condition.values)
+                            changed = True
+                        else:
+                            filters.append(condition)
+                    child.ifs = filters
+                visit(child)
+        # Generator-expression children need an owner trial even when the
+        # owner's own instructions already match. Full subtree proof retains
+        # their capture contracts and rejects genuine disjunctive filters.
+        visit(owner)
+        return changed
+
+    edits = (('inplace-operation', inplace), ('singleton-expanded-tuple', singleton_expansions),
+             ('carried-container-result', carried_results), ('top-package-import', dotted_imports),
+             ('compound-conditional-value', conditional_values),
+             ('conjunctive-comprehension-filters', conjunctive_filters))
+
+    def trials(owner, original, candidate):
+        for label, edit in edits:
+            trial = copy.deepcopy(owner)
+            if edit(trial):
+                yield label, trial.body
+        trial = copy.deepcopy(owner)
+        selected = [label for label, edit in edits if edit(trial)]
+        if len(selected) > 1:
+            yield 'coupled-existing-value-shapes', trial.body
     return _prove_function_trials(tree, reference, decoder, trials)
 
 
@@ -2152,6 +2275,7 @@ def recover(sequence: Path, backend: Path) -> dict:
         tree, report['verified_coupled_statement_shapes'] = restore_coupled_statement_shapes(tree, code, transformer)
         tree, report['verified_individual_return_edges'] = preserve_individual_return_edges(tree, code, transformer)
         tree, report['verified_residual_statement_shapes'] = restore_residual_statement_shapes(tree, code, transformer)
+        tree, report['verified_substantive_value_shapes'] = restore_substantive_value_shapes(tree, code, transformer)
         source = ast.unparse(tree) + '\n'
         if report['verified_shared_return_shapes']:
             lines = []
