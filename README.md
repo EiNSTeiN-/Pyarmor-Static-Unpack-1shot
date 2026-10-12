@@ -40,6 +40,13 @@ Parameters, public bindings, nonlocal cells, colliding names and ambiguous
 definitions are retained. This fixes generated nested helper names without
 relaxing comparison of their bodies or callers.
 
+When a compiler's optimized builtin-generator path is replaced with its
+ordinary callable path, the synthetic forward jump is removed only if all
+intervening words have already been masked as unreachable padding. This
+preserves an enclosing short-circuit guard without inventing an `else` boundary.
+Instruction addresses stay fixed. Owned tests check captured generators,
+shadowed callables, lazy call order, computed rejection returns and idempotency.
+
 Removing a recognized runtime exit/rethrow layer preserves its route into
 the compiler's StopIteration handler. The normalizer validates the complete
 rethrow, cleanup, and outer-handler chain before reconnecting it. Owned
@@ -85,6 +92,14 @@ count can then be omitted from comparison, and the source initializer is
 removed using the original class metadata. This restores the class docstring
 and avoids inventing a public attribute. Used cells and explicit attributes
 remain significant; owned tests cover dataclass fields and namespace behavior.
+
+The verifier permits one coupled predicate spelling variance: `IS_OP 1`
+immediately consumed by a truth jump is canonicalized to `IS_OP 0` with the
+opposite truth jump, retaining the destination and fallthrough. Identity tests
+produce a builtin bool, so this cannot call user equality or truth methods.
+Changing either operation alone, its target, or intervening meaningful work
+still fails. An owned behavior test includes objects whose truth/equality
+methods raise, and negative tests enforce those boundaries.
 
 Run the original-fixture regression tests with:
 

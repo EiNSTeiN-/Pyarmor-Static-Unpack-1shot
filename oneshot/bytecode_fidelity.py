@@ -242,6 +242,19 @@ def canonical(code, decoder=None):
     for index, (name, operand) in enumerate(ops):
         if isinstance(operand, tuple) and operand[:1] == ('target_offset',):
             ops[index] = (name, ('target', position(operand[1])))
+    # Identity tests always produce a builtin bool. Inverting both IS_OP
+    # and the immediately consuming truth jump leaves exactly the same
+    # predicate, target and fallthrough; no user truth/equality method runs.
+    # Keep either inversion alone, intervening work and destinations strict.
+    for index in range(len(ops) - 1):
+        if ops[index] != ('IS_OP', 1):
+            continue
+        branch, destination = ops[index + 1]
+        inverse = {'POP_JUMP_IF_TRUE': 'POP_JUMP_IF_FALSE',
+                   'POP_JUMP_IF_FALSE': 'POP_JUMP_IF_TRUE'}.get(branch)
+        if inverse:
+            ops[index] = ('IS_OP', 0)
+            ops[index + 1] = (inverse, destination)
     exceptions = []
     for entry in dis.Bytecode(code).exception_entries:
         region = (position(entry.start), position(entry.end), position(entry.target), entry.depth, entry.lasti)

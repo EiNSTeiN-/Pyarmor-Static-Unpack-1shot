@@ -13,6 +13,35 @@ from modern_backend import MarkerNormalizer, _varint, unused_future_annotation_o
 
 @unittest.skipUnless(sys.version_info[:2] == (3, 14), 'Requires CPython 3.14')
 class FidelityTests(unittest.TestCase):
+    def test_coupled_identity_and_truth_jump_inversion_preserves_the_predicate(self):
+        code = next(value for value in compile_source(
+            'def select(value):\n    if value is True:\n        return 7\n    return 3\n',
+            'owned.py').co_consts if isinstance(value, types.CodeType))
+        instructions = list(dis.get_instructions(code))
+        identity = next(item for item in instructions if item.opname == 'IS_OP')
+        branch = next(item for item in instructions if item.opname == 'POP_JUMP_IF_FALSE')
+        changed = bytearray(code.co_code)
+        changed[identity.offset + 1] = 1
+        changed[branch.offset] = dis.opmap['POP_JUMP_IF_TRUE']
+        equivalent = code.replace(co_code=bytes(changed))
+        self.assertTrue(compare(code, equivalent)['all_units_match'])
+        class NoUserComparison:
+            def __eq__(self, other):
+                raise AssertionError('Identity must not call equality')
+            def __bool__(self):
+                raise AssertionError('Identity must not call truth conversion')
+        for value in (True, False, None, 0, 1, NoUserComparison()):
+            self.assertEqual(types.FunctionType(equivalent, {})(value),
+                             types.FunctionType(code, {})(value))
+        identity_only = bytearray(code.co_code)
+        identity_only[identity.offset + 1] = 1
+        self.assertFalse(compare(code, code.replace(co_code=bytes(identity_only)))['all_units_match'])
+        branch_only = bytearray(code.co_code)
+        branch_only[branch.offset] = dis.opmap['POP_JUMP_IF_TRUE']
+        self.assertFalse(compare(code, code.replace(co_code=bytes(branch_only)))['all_units_match'])
+        # Changing the destination still fails even with the coupled inverse.
+        changed[branch.offset + 1] = 0
+        self.assertFalse(compare(code, code.replace(co_code=bytes(changed)))['all_units_match'])
     def test_unused_future_annotation_cell_is_only_compiler_bookkeeping(self):
         source = 'from __future__ import annotations\nclass Result:\n    "Documented."\n'
         reference = compile_source(source + '    if False:\n        unused: int\n    amount: int\n', 'reference.py')

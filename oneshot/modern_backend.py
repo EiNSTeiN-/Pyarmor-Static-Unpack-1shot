@@ -286,6 +286,19 @@ def normalize_code(code: types.CodeType) -> types.CodeType:
             end = instructions[index + 1].offset if index + 1 < len(instructions) else len(bytecode)
             for offset in range(instruction.offset, end, 2):
                 bytecode[offset:offset + 2] = bytes((dis.opmap['NOP'], 0))
+    # Once the selected slow path's intervening fast implementation is
+    # entirely masked, its synthetic jump can fall through that padding.
+    # A source parser must not mistake this implementation-only jump for
+    # an else boundary in an enclosing short-circuit expression. Never
+    # erase a jump over any remaining meaningful instruction.
+    for offset, target in forced_jumps.items():
+        if target > offset and all(bytecode[index] == dis.opmap['NOP']
+                                   for index in range(offset + 2, target, 2)):
+            bytecode[offset:offset + 2] = bytes((dis.opmap['NOP'], 0))
+            previous = offset - 2
+            while previous >= 0 and bytecode[previous] == dis.opmap['EXTENDED_ARG']:
+                bytecode[previous:previous + 2] = bytes((dis.opmap['NOP'], 0))
+                previous -= 2
     table = bytearray()
     for entry in entries:
         if entry.target not in reachable:

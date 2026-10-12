@@ -166,6 +166,43 @@ class ModernBackendTests(native.Python314Tests):
             for values in ([], [-1, 0, 2], [1, 2, 3]):
                 self.assertEqual(reconstructed['select'](values), original['select'](values))
 
+    def test_builtin_generator_in_shared_rejection_guard_keeps_computed_return(self):
+        source = ('def select(values, build):\n'
+                  '    if not values or not all(value > 0 for value in values):\n'
+                  '        return build("reject", amount=0)\n'
+                  '    return build("accept", amount=sum(values))\n')
+        original, reconstructed = self.recover(source)
+        for values in ([], [-1, 2], [0], [1, 2], [float('nan')]):
+            outputs = []
+            for namespace in (original, reconstructed):
+                calls = []
+                def build(kind, **options):
+                    calls.append((kind, options))
+                    return kind, options
+                outputs.append((namespace['select'](values, build), calls))
+            self.assertEqual(outputs[1], outputs[0])
+        from bytecode_fidelity import compare
+        self.assertTrue(compare(compile(source, 'reference.py', 'exec', dont_inherit=True),
+                                compile(self.last_generated, 'candidate.py', 'exec',
+                                        dont_inherit=True))['all_units_match'])
+
+    def test_guarded_generator_keeps_closure_capture_and_shadowed_callable(self):
+        original, reconstructed = self.recover(
+            'def select(values, threshold, all):\n'
+            '    if not values or not all(value > threshold for value in values):\n'
+            '        return "reject"\n'
+            '    return "accept"\n')
+        for values in ([], [0, 2], [3, 4]):
+            results = []
+            for namespace in (original, reconstructed):
+                calls = []
+                def replacement(items):
+                    items = tuple(items)
+                    calls.append(items)
+                    return bool(items) and items[0]
+                results.append((namespace['select'](values, 1, replacement), calls))
+            self.assertEqual(results[1], results[0])
+
     def test_shadowed_builtin_fast_path(self):
         original, reconstructed = self.recover(
             'def select(values, any):\n    return any(value > 0 for value in values)\n')
@@ -210,6 +247,29 @@ class ModernBackendTests(native.Python314Tests):
 
 
 class NormalizationTests(unittest.TestCase):
+    @unittest.skipUnless(sys.version_info[:2] == (3, 14), 'Requires CPython 3.14')
+    def test_selected_builtin_padding_is_idempotent_and_keeps_shadowed_call_order(self):
+        import types
+        module = compile('def select(values):\n'
+                         '    if not values or not all(value > 0 for value in values):\n'
+                         '        return "reject"\n'
+                         '    return "accept"\n', 'fixture.py', 'exec', dont_inherit=True)
+        function = next(value for value in module.co_consts if isinstance(value, types.CodeType))
+        normalized = normalize_code(function)
+        repeated = normalize_code(normalized)
+        self.assertEqual(repeated.co_code, normalized.co_code)
+        self.assertEqual(repeated.co_exceptiontable, normalized.co_exceptiontable)
+        for values in ([], [0, 2], [1, 2]):
+            outputs = []
+            for code in (function, normalized):
+                calls = []
+                def shadowed(items):
+                    result = tuple(items)
+                    calls.append(result)
+                    return all(result)
+                result = types.FunctionType(code, {'all': shadowed})(values)
+                outputs.append((result, calls))
+            self.assertEqual(outputs[1], outputs[0])
     def test_parallel_marker_removal_preserves_rhs_then_target_order(self):
         import ast
         source = ('target.first, __assert_armored__, target.second = '
