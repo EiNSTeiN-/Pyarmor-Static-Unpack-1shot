@@ -31,6 +31,12 @@ The pinned backend also preserves independent for-loop rejection guards, so a
 return cannot escape the guard that assigned its value. Owned bytecode/behavior
 checks include invalid rows, None and false values, getter order and identity
 tests that must not invoke user truth conversion.
+Padded try returns also keep their existing calculated value. The backend
+requires a previously recognized padding/return tail and a single live
+expression, without a with protocol. Native export, modern reconstruction and
+whole-unit verification are tested together, including call/getter failures,
+fallback paths and base exceptions. Comparison and normalization rules stay
+unchanged.
 The lookup repair requires an unprotected suite, the assigned local's later
 None guard and a return of that same local. Other guard and handler layouts keep
 their existing handling; broad guard inversion failed corpus-retention checks.
