@@ -7,6 +7,7 @@ The sequence's AES material stays local and is never written to this report.
 from __future__ import annotations
 
 import ast
+from collections import defaultdict
 import dis
 import importlib.util
 import json
@@ -568,6 +569,90 @@ class FutureAnnotationNormalizer(ast.NodeTransformer):
         return self.generic_visit(node)
 
 
+def preserve_shared_returns(tree, reference, decoder):
+    """Retain a compiler shared-return shape only after exact unit proof.
+
+    CPython can duplicate an implicit terminal None return. A constant-folded
+    expression at the end of the source instead keeps the shared edge found in
+    some recovered functions. This changes no runtime predicate and supplies
+    no missing work. Never accept it on syntax or behavior tests alone.
+    """
+    # Import lazily: the verifier itself imports this normalizer. Both tools
+    # are fully initialized by the time source reconstruction reaches here.
+    try:
+        from .bytecode_fidelity import compare, compile_source, units
+    except ImportError:
+        from bytecode_fidelity import compare, compile_source, units
+
+    class Definitions(ast.NodeVisitor):
+        def __init__(self):
+            self.prefix = ''
+            self.nodes = defaultdict(list)
+
+        def visit_ClassDef(self, node):
+            prefix = self.prefix
+            self.prefix += node.name + '.'
+            self.generic_visit(node)
+            self.prefix = prefix
+
+        def visit_FunctionDef(self, node):
+            name = self.prefix + node.name
+            self.nodes[name].append(node)
+            prefix = self.prefix
+            self.prefix = name + '.<locals>.'
+            self.generic_visit(node)
+            self.prefix = prefix
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+    def checked_compile():
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', SyntaxWarning)
+            return compile_source(ast.unparse(ast.fix_missing_locations(tree)), '<static-source-candidate>')
+
+    def matched(candidate):
+        return {entry['unit'] for entry in compare(reference, candidate, decoder)['entries']
+                if entry['matched']}
+
+    candidate = checked_compile()
+    before = matched(candidate)
+    by_qualname = defaultdict(list)
+    for path, code in units(candidate):
+        by_qualname[code.co_qualname].append((path, code))
+    definitions = Definitions()
+    definitions.visit(tree)
+    attempted = {}
+    for name, nodes in definitions.nodes.items():
+        if len(nodes) != 1 or len(by_qualname[name]) != 1:
+            continue
+        path, code = by_qualname[name][0]
+        # Async generators cannot have a value-bearing return expression.
+        if path in before or code.co_flags & 0x200:
+            continue
+        node = nodes[0]
+        node.body.append(ast.Return(ast.IfExp(ast.Constant(True), ast.Constant(None), ast.Constant(None))))
+        attempted[path] = node
+    if not attempted:
+        return tree, []
+    tested = matched(checked_compile())
+    selected = {}
+    for path, node in attempted.items():
+        if path in tested:
+            selected[path] = node
+        else:
+            node.body.pop()
+    if not selected:
+        return tree, []
+    after = matched(checked_compile())
+    if not before.issubset(after) or not set(selected).issubset(after):
+        # Removing an unproven neighboring change must not invalidate either
+        # an old match or an accepted new one. Fall back without any edits.
+        for node in selected.values():
+            node.body.pop()
+        return tree, []
+    return tree, sorted(selected)
+
+
 def recover(sequence: Path, backend: Path) -> dict:
     """Use the native export beside sequence and write validated source + status."""
     prefix = Path(str(sequence).removesuffix('.seq'))
@@ -604,7 +689,16 @@ def recover(sequence: Path, backend: Path) -> dict:
                and any(alias.name == 'annotations' for alias in statement.names)
                for statement in tree.body):
             tree = ast.fix_missing_locations(FutureAnnotationNormalizer().visit(tree))
+        tree, report['verified_shared_return_shapes'] = preserve_shared_returns(tree, code, transformer)
         source = ast.unparse(tree) + '\n'
+        if report['verified_shared_return_shapes']:
+            lines = []
+            for line in source.splitlines():
+                if line.lstrip() == 'return None if True else None':
+                    indent = line[:len(line) - len(line.lstrip())]
+                    lines.append(indent + '# Folded expression preserves the verified shared-return edge.')
+                lines.append(line)
+            source = '\n'.join(lines) + '\n'
         with warnings.catch_warnings(record=True) as found_warnings:
             warnings.simplefilter('always', SyntaxWarning)
             compile(source, str(output), 'exec', dont_inherit=True) # Validation only. Never execute.

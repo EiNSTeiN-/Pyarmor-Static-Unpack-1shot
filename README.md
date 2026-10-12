@@ -101,6 +101,16 @@ Changing either operation alone, its target, or intervening meaningful work
 still fails. An owned behavior test includes objects whose truth/equality
 methods raise, and negative tests enforce those boundaries.
 
+Source reconstruction can preserve a shared terminal None return with a
+constant-folded `return None if True else None` expression. The tool accepts this
+only when the entire function unit (including signature, branches and exception
+dispatch) then matches the recovered bytecode. It reverts unproven attempts,
+skips ambiguous definitions and async generators, and checks that no previously
+matched unit is lost. No verifier rule is weakened. Owned tests compare truth
+hooks, closures, generators and coroutines and reject different constants,
+parameters and handler types. The recovery report lists exactly the accepted
+unit paths in `verified_shared_return_shapes`.
+
 Run the original-fixture regression tests with:
 
 ```bash
