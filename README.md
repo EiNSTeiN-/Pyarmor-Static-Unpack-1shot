@@ -465,3 +465,34 @@ source API; five changed modules are regenerated. Every source then receives
 the full original-bytecode audit. Raw and composite views each gain three
 units with no losses, reaching 13,824/14,291 composite matches; 467 units remain.
 All 183 unpacker cases also pass against backend 0.6.20 locally.
+
+The subsequent `comprehension-defaults-01` audit uses unchanged API 0.4.27
+and native backend 0.6.21. Every output is compared, with 218 identical source
+inputs reused and 56 changed outputs regenerated. All 274 candidates receive
+the complete audit: raw/composite each gain one and lose zero, reaching
+13,825/14,291 composite matches, with 466 unresolved. This is separate from
+the readable source subset and does not imply complete recovery.
+
+### Coupled rejection guards and validated suffix ownership
+
+Version 0.4.28 development tries up to four non-overlapping rejection chains
+together. A single correction can fail proof when another broken guard remains
+in the same owner. Existing predicates and rejection work are reused; negation
+and inverse comparison spelling are separate candidates because `__eq__` and
+`__ne__` need not agree. Flattened OR paths retain the original short circuit.
+An inner accepting guard may also reclaim the existing outer suffix whose
+ownership was lost. Empty guards can reclaim adjacent handler-bearing work
+while preserving the handler's success suffix outside the guard. These trials
+can also carry an existing result back into its original outer protected scope.
+An adjacent optional-query handler can return to its context body. Genuine
+sibling work, independent queries and distinct protected scopes must remain
+unchanged unless the complete original-bytecode proof selects the repair.
+
+Every accepted shape must match the complete owner, descendants, instructions
+and exception tables, with all prior module matches retained. Nine new owned
+tests cover coupled validation errors, chronological fallbacks, generator
+children, sibling work, rich-comparison independence and short-circuit call
+order, guarded date/timer parsing, clamping errors, optional-query faults and
+context exits. All 192 unpacker cases pass locally, with one existing expected failure.
+The full application zero-loss audit remains required before publication or
+promotion of this development version; comparator rules remain unchanged.

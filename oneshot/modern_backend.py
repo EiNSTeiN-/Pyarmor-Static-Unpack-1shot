@@ -1328,6 +1328,130 @@ def restore_residual_statement_shapes(tree, reference, decoder):
     return _prove_function_trials(tree, reference, decoder, trials)
 
 
+def restore_shared_guard_shapes(tree, reference, decoder):
+    """Prove coupled guard ownership using existing predicates and work.
+
+    Rejection chains may need several sites repaired together. Candidate
+    generation is bounded to four non-overlapping chains and keeps the full
+    owner/descendant and module-retention proof. Negation spelling is tried,
+    never assumed equivalent for rich comparisons.
+    """
+    def rejection_sites(owner):
+        sites = []
+        nested = set()
+        for node in _function_nodes(owner):
+            if not isinstance(node, ast.If) or node.orelse or id(node) in nested:
+                continue
+            conditions = []
+            branch = node
+            while (not branch.orelse and len(branch.body) == 1
+                   and isinstance(branch.body[0], ast.If)
+                   and not branch.body[0].orelse):
+                conditions.append(branch.test)
+                branch = branch.body[0]
+                nested.add(id(branch))
+            if conditions and branch.body and isinstance(branch.body[-1],
+                    (ast.Return, ast.Raise, ast.Continue, ast.Break)):
+                sites.append((node, conditions, branch.test, branch.body))
+        return sites
+
+    def negative(test, comparison_form):
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            return copy.deepcopy(test.operand)
+        if isinstance(test, ast.BoolOp):
+            operation = ast.Or() if isinstance(test.op, ast.And) else ast.And()
+            values = [negative(value, comparison_form) for value in test.values]
+            return ast.BoolOp(operation, values)
+        inverse = {ast.Eq: ast.NotEq, ast.NotEq: ast.Eq, ast.Is: ast.IsNot,
+                   ast.IsNot: ast.Is, ast.In: ast.NotIn, ast.NotIn: ast.In}
+        if (comparison_form and isinstance(test, ast.Compare) and len(test.ops) == 1
+                and type(test.ops[0]) in inverse):
+            return ast.Compare(copy.deepcopy(test.left),
+                [inverse[type(test.ops[0])]()], copy.deepcopy(test.comparators))
+        return ast.UnaryOp(ast.Not(), copy.deepcopy(test))
+
+    def flattened_or(values):
+        result = []
+        for value in values:
+            if isinstance(value, ast.BoolOp) and isinstance(value.op, ast.Or):
+                result.extend(value.values)
+            else:
+                result.append(value)
+        return ast.BoolOp(ast.Or(), result)
+
+    def region_shapes(owner):
+        for suite_index, (parent, field, suite) in enumerate(_statement_suites(owner)):
+            for index, statement in enumerate(suite[:-1]):
+                following = suite[index + 1]
+                if not isinstance(following, ast.Try) or following.finalbody:
+                    continue
+                if (isinstance(statement, ast.If) and not statement.orelse
+                        and all(isinstance(node, ast.Pass) for node in statement.body)):
+                    clone = copy.deepcopy(owner)
+                    target, name, block = list(_statement_suites(clone))[suite_index]
+                    branch, region = block[index:index + 2]
+                    suffix, region.orelse = region.orelse, []
+                    branch.body = [region]
+                    setattr(target, name, block[:index + 1] + suffix + block[index + 2:])
+                    yield 'guarded-existing-handler-and-success-suffix', clone
+                    # A result displaced from the same outer handler can
+                    # require both scope repairs together. Carry its existing
+                    # value; do not synthesize a return or fallback expression.
+                    if (isinstance(parent, ast.Try) and field == 'body'
+                            and len(owner.body) >= 2 and owner.body[-2] is parent
+                            and isinstance(owner.body[-1], ast.Return)):
+                        coupled = copy.deepcopy(clone)
+                        coupled.body[-2].body.append(coupled.body.pop())
+                        yield 'guarded-handler-and-outer-protected-result', coupled
+                if isinstance(statement, (ast.With, ast.AsyncWith)):
+                    clone = copy.deepcopy(owner)
+                    target, name, block = list(_statement_suites(clone))[suite_index]
+                    block[index].body.append(block[index + 1])
+                    setattr(target, name, block[:index + 1] + block[index + 2:])
+                    yield 'context-owns-existing-optional-handler', clone
+                if (isinstance(statement, ast.Try) and not statement.orelse
+                        and not statement.finalbody and len(statement.body) == 1
+                        and isinstance(statement.body[0], (ast.With, ast.AsyncWith))):
+                    clone = copy.deepcopy(owner)
+                    target, name, block = list(_statement_suites(clone))[suite_index]
+                    block[index].body[0].body.append(block[index + 1])
+                    setattr(target, name, block[:index + 1] + block[index + 2:])
+                    yield 'protected-context-owns-existing-optional-handler', clone
+
+    def trials(owner, original, candidate):
+        sites = rejection_sites(owner)
+        if 0 < len(sites) <= 4:
+            for mask in range(1, 1 << len(sites)):
+                for comparison_form in (False, True):
+                    clone = copy.deepcopy(owner)
+                    for index, (branch, conditions, terminal, body) in enumerate(rejection_sites(clone)):
+                        if mask & (1 << index):
+                            branch.test = flattened_or([
+                                negative(test, comparison_form) for test in conditions] + [terminal])
+                            branch.body = body
+                    yield f'coupled-rejection-{mask}-comparison-{comparison_form}', clone.body
+        # A validated inner guard can lose ownership of the outer suffix.
+        # Reuse that suffix verbatim; authentic sibling work is rejected by
+        # complete control-flow and exception proof.
+        for suite_index, (_, _, suite) in enumerate(_statement_suites(owner)):
+            for index, branch in enumerate(suite):
+                if (isinstance(branch, ast.If) and not branch.orelse
+                        and 1 < len(branch.body) <= 17
+                        and isinstance(branch.body[0], ast.If)
+                        and not branch.body[0].orelse):
+                    clone = copy.deepcopy(owner)
+                    target = list(_statement_suites(clone))[suite_index][2][index]
+                    target.body[0].body.extend(target.body[1:])
+                    target.body = target.body[:1]
+                    yield 'inner-guard-owns-existing-suffix', clone.body
+        for label, base in region_shapes(owner):
+            yield label, base.body
+            clone = copy.deepcopy(base)
+            clone.body.append(ast.Return(_fold_value(None, 1)))
+            yield label + '-shared-implicit-none', clone.body
+    return _prove_function_trials(tree, reference, decoder, trials)
+
+
 def restore_substantive_value_shapes(tree, reference, decoder):
     """Recover existing operands and bindings only with full subtree proof.
 
@@ -2276,6 +2400,7 @@ def recover(sequence: Path, backend: Path) -> dict:
         tree, report['verified_individual_return_edges'] = preserve_individual_return_edges(tree, code, transformer)
         tree, report['verified_residual_statement_shapes'] = restore_residual_statement_shapes(tree, code, transformer)
         tree, report['verified_substantive_value_shapes'] = restore_substantive_value_shapes(tree, code, transformer)
+        tree, report['verified_shared_guard_shapes'] = restore_shared_guard_shapes(tree, code, transformer)
         source = ast.unparse(tree) + '\n'
         if report['verified_shared_return_shapes']:
             lines = []
