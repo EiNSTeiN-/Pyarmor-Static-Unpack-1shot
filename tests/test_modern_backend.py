@@ -132,6 +132,35 @@ class ModernBackendTests(native.Python314Tests):
                             self.assertEqual(reconstructed['select'](values),
                                              original['select'](values))
 
+    def test_shared_raise_guard_keeps_formatted_message_chain_cleanup_and_cause(self):
+        from bytecode_fidelity import compare, compile_source
+        source = ('def select(value, read, invalid, make_error, make_cause):\n'
+                  '    if value is None or not 0 <= read(value) <= 10 or invalid(value):\n'
+                  '        raise make_error(f"invalid {value!r}") from make_cause(value)\n'
+                  '    return value\n')
+        original, reconstructed = self.recover(source)
+        self.assertTrue(compare(compile_source(source, 'owned-reference'),
+                                compile_source(self.last_generated, 'owned-candidate'))['all_units_match'])
+        def exercise(function, value, rejects):
+            calls = []
+            def read(item):
+                calls.append(('read', item)); return item
+            def invalid(item):
+                calls.append(('invalid', item)); return rejects
+            def make_error(message):
+                calls.append(('error', message)); return ValueError(message)
+            def make_cause(item):
+                calls.append(('cause', item)); return RuntimeError('cause')
+            try: result = ('value', function(value, read, invalid, make_error, make_cause))
+            except ValueError as error:
+                result = ('ValueError', str(error), type(error.__cause__).__name__,
+                          str(error.__cause__), error.__suppress_context__)
+            return result, calls
+        for value in (None, -1, 0, 5, 10, 11):
+            for rejects in (False, True):
+                self.assertEqual(exercise(reconstructed['select'], value, rejects),
+                                 exercise(original['select'], value, rejects))
+
     def test_annotated_class_preserves_docstring_and_annotations(self):
         original, reconstructed = self.recover(
             'from __future__ import annotations\n'
