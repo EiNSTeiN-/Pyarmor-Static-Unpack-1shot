@@ -369,3 +369,24 @@ It is more meaningful to understand how Pyarmor or this tool works, and then try
 ## Star Chart
 
 [![Stargazers over time](https://starchart.cc/Lil-House/Pyarmor-Static-Unpack-1shot.svg?variant=adaptive)](https://starchart.cc/Lil-House/Pyarmor-Static-Unpack-1shot)
+
+### Coupled source-shape repairs
+
+Adjacent identical handler fragments sometimes need both reunion and relocation
+of an existing final return into the reunited try. The fork trials those repairs
+atomically: either the complete function's meaningful instructions and dispatch
+map match, or both edits are rolled back. Intervening work, different handlers,
+and else/finally suites are excluded. An empty try/finally may similarly require
+its existing await-return to move before cleanup; owned ContextVar tests check
+success, failure, cancellation, and restoration timing.
+
+Other narrowly scoped AST trials restore separate CALL_FUNCTION_EX keyword
+merges, split chained comprehension filters, and inverted loop continuation
+guards. Each reuses only expressions already present in the candidate. Keyword
+trials retain Python's duplicate-key TypeError instead of silently overwriting
+inside a dict literal; genuine dict-literal calls are not changed. Filter trials
+retain a chained comparison's single middle evaluation. Loop trials retain
+continue ownership and success-return scope, excluding nested-loop continuations.
+These trials require full unit proof and preservation of every prior matched
+unit after unsuccessful neighboring edits are rolled back. They do not widen
+the bytecode verifier's normalization rules.

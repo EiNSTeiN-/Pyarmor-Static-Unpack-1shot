@@ -733,6 +733,196 @@ def restore_capture_name_order(tree, reference, decoder):
     return trial, sorted(new_matches - old_matches)
 
 
+def _prove_function_edits(tree, reference, decoder, edit):
+    """Accept scoped AST edits only after complete unit and retention proof.
+
+    The caller returns attribute undo records, without traversing nested code
+    scopes. A failed neighbor is rolled back before the final whole-tree
+    comparison; a matched child can never be sacrificed for its parent.
+    """
+    try:
+        from .bytecode_fidelity import compare, compile_source, units
+    except ImportError:
+        from bytecode_fidelity import compare, compile_source, units
+
+    def checked():
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', SyntaxWarning)
+            compiled = compile_source(ast.unparse(ast.fix_missing_locations(tree)), '<scoped-edit-trial>')
+        matches = {entry['unit'] for entry in compare(reference, compiled, decoder)['entries']
+                   if entry['matched']}
+        return compiled, matches
+
+    tree = ast.parse(ast.unparse(ast.fix_missing_locations(tree)))
+    definitions = defaultdict(list)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            line = node.decorator_list[0].lineno if node.decorator_list else node.lineno
+            definitions[node.name, line].append(node)
+    compiled, before = checked()
+    attempted = {}
+    for path, code in units(compiled):
+        owners = definitions[code.co_name, code.co_firstlineno]
+        if path in before or len(owners) != 1:
+            continue
+        records = edit(owners[0])
+        if records:
+            attempted[path] = records
+    if not attempted:
+        return tree, []
+    def undo(records):
+        for node, field, previous in reversed(records):
+            setattr(node, field, previous)
+    try:
+        _, tentative = checked()
+        selected = {}
+        for path, records in attempted.items():
+            if path in tentative:
+                selected[path] = records
+            else:
+                undo(records)
+        _, after = checked()
+        if not (before | selected.keys()).issubset(after):
+            for records in reversed(list(selected.values())):
+                undo(records)
+            return tree, []
+        return tree, sorted(selected)
+    except (SyntaxError, ValueError):
+        for records in reversed(list(attempted.values())):
+            undo(records)
+        return tree, []
+
+
+def _function_nodes(owner):
+    """Walk only this function's code scope, including inline comprehensions."""
+    scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda, ast.GeneratorExp)
+    for child in ast.iter_child_nodes(owner):
+        if not isinstance(child, scopes):
+            yield child
+            yield from _function_nodes(child)
+
+
+def restore_expanded_keyword_merges(tree, reference, decoder):
+    """Recover CALL_FUNCTION_EX merge boundaries without losing duplicate checks.
+
+    A call with several keyword expansions can be emitted as one dictionary
+    literal. DICT_UPDATE in that literal overwrites duplicates, whereas the
+    original call's DICT_MERGE raises TypeError. Reuse its existing ordered
+    expressions and prove the whole unit before splitting the literal.
+    Genuine dictionary-literal arguments keep their original shape.
+    """
+    def eligible(node):
+        return (isinstance(node, ast.Call) and any(
+            keyword.arg is None and isinstance(keyword.value, ast.Dict)
+            and any(key is None for key in keyword.value.keys)
+            for keyword in node.keywords))
+    if not any(eligible(node) for node in ast.walk(tree)):
+        return tree, []
+    def edit(owner):
+        records = []
+        for node in _function_nodes(owner):
+            if not eligible(node):
+                continue
+            expanded = []
+            for argument in node.keywords:
+                value = argument.value
+                if argument.arg is not None or not isinstance(value, ast.Dict) or not any(key is None for key in value.keys):
+                    expanded.append(argument)
+                    continue
+                named = set()
+                for key, expression in zip(value.keys, value.values):
+                    if key is None:
+                        expanded.append(ast.keyword(None, expression))
+                    elif (isinstance(key, ast.Constant) and isinstance(key.value, str)
+                          and key.value.isidentifier() and not keyword.iskeyword(key.value)
+                          and key.value not in named):
+                        expanded.append(ast.keyword(key.value, expression))
+                        named.add(key.value)
+                    else:
+                        expanded.append(ast.keyword(None, ast.Dict([key], [expression])))
+            # Duplicate explicit names would be invalid source. Keep this
+            # candidate untouched rather than inventing grouping boundaries.
+            names = [keyword.arg for keyword in expanded if keyword.arg is not None]
+            if len(names) != len(set(names)):
+                continue
+            records.append((node, 'keywords', node.keywords))
+            node.keywords = expanded
+        return records
+    return _prove_function_edits(tree, reference, decoder, edit)
+
+
+def restore_chained_comprehension_filters(tree, reference, decoder):
+    """Rejoin split comparison filters only with exact evaluation proof."""
+    def edit(owner):
+        records = []
+        for node in _function_nodes(owner):
+            if not isinstance(node, ast.comprehension):
+                continue
+            filters = list(node.ifs)
+            for index in range(len(filters) - 2, -1, -1):
+                left, right = filters[index:index + 2]
+                if (isinstance(left, ast.Compare) and isinstance(right, ast.Compare)
+                        and ast.dump(left.comparators[-1]) == ast.dump(right.left)):
+                    filters[index:index + 2] = [ast.Compare(
+                        left.left, left.ops + right.ops, left.comparators + right.comparators)]
+            if len(filters) != len(node.ifs):
+                records.append((node, 'ifs', node.ifs))
+                node.ifs = filters
+        return records
+    if not any(isinstance(node, ast.comprehension) and len(node.ifs) > 1 for node in ast.walk(tree)):
+        return tree, []
+    return _prove_function_edits(tree, reference, decoder, edit)
+
+
+def restore_loop_rejection_guards(tree, reference, decoder):
+    """Recover an inverted continue guard, reusing its existing predicate/body.
+
+    No new predicate or work is supplied. Continuations owned by nested loops
+    or definitions do not qualify; the exact instruction and dispatch proof
+    decides whether later statements belonged outside the accepting branch.
+    """
+    def has_continue(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.For, ast.AsyncFor, ast.While, ast.FunctionDef,
+                                  ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            if isinstance(child, ast.Continue) or has_continue(child):
+                return True
+        return False
+    def edit(owner):
+        records = []
+        def visit(node, in_loop=False):
+            for _, block in ast.iter_fields(node):
+                if not isinstance(block, list) or not block or not isinstance(block[0], ast.stmt):
+                    continue
+                previous = list(block)
+                changed = []
+                for statement in previous:
+                    nested = in_loop or isinstance(statement, (ast.For, ast.AsyncFor, ast.While))
+                    if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        visit(statement, nested)
+                    if (in_loop and isinstance(statement, ast.If) and not statement.orelse
+                            and not all(isinstance(item, ast.Continue) for item in statement.body)
+                            and has_continue(statement)):
+                        changed.append(ast.If(ast.UnaryOp(ast.Not(), statement.test), [ast.Continue()], []))
+                        changed.extend(statement.body)
+                    else:
+                        changed.append(statement)
+                if changed != previous:
+                    # Store the owning field rather than mutating the old
+                    # list: nested-suite undo remains independent.
+                    for field, value in ast.iter_fields(node):
+                        if value is block:
+                            records.append((node, field, block))
+                            setattr(node, field, changed)
+                            break
+        visit(owner)
+        return records
+    if not any(isinstance(node, ast.Continue) for node in ast.walk(tree)):
+        return tree, []
+    return _prove_function_edits(tree, reference, decoder, edit)
+
+
 def restore_compound_return_shapes(tree, reference, decoder):
     """Restore a return expression only when its entire code unit is proven.
 
@@ -845,7 +1035,8 @@ def restore_shared_try_fragments(tree, reference, decoder):
     handlers. Identical source handlers alone do not establish equivalence:
     a trial must match the original instructions and dispatch map and retain
     every previously matched unit. Else/finally suites and intervening work
-    are not candidates for this reconstruction.
+    are not candidates for reunion. A reunited body can also need its existing
+    final return moved back under the handler; prove those shapes together.
     """
     try:
         from .bytecode_fidelity import compare, compile_source, units
@@ -912,6 +1103,7 @@ def restore_shared_try_fragments(tree, reference, decoder):
     definitions = Definitions()
     definitions.visit(tree)
     attempted = {}
+    owners = {}
     for name, nodes in definitions.nodes.items():
         if len(nodes) != 1 or len(by_name[name]) != 1 or by_name[name][0] in matching:
             continue
@@ -934,10 +1126,36 @@ def restore_shared_try_fragments(tree, reference, decoder):
                 index = first - 1
         if edits:
             attempted[by_name[name][0]] = edits
+            owners[by_name[name][0]] = nodes[0]
     if not attempted:
         return tree, []
     _, tentative = check()
     tested = {entry['unit'] for entry in tentative['entries'] if entry['matched']}
+    hoisted = {}
+    for path, owner in owners.items():
+        if path in tested:
+            continue
+        edits = []
+        for block in blocks(owner):
+            if (len(block) >= 2 and isinstance(block[-1], ast.Return)
+                    and handler_key(block[-2]) is not None):
+                region, statement = block[-2:]
+                edits.append((block, len(block) - 1, region, statement))
+                block.pop()
+                region.body.append(statement)
+        if edits:
+            hoisted[path] = edits
+    def restore_hoisted(edits):
+        for block, index, region, statement in reversed(edits):
+            region.body.remove(statement)
+            block.insert(index, statement)
+    if hoisted:
+        _, joint = check()
+        tested = {entry['unit'] for entry in joint['entries'] if entry['matched']}
+        for path, edits in list(hoisted.items()):
+            if path not in tested:
+                restore_hoisted(edits)
+                del hoisted[path]
     selected = {}
     for path, edits in attempted.items():
         if path in tested:
@@ -949,6 +1167,8 @@ def restore_shared_try_fragments(tree, reference, decoder):
     _, final = check()
     after = {entry['unit'] for entry in final['entries'] if entry['matched']}
     if not matching.issubset(after) or not set(selected).issubset(after):
+        for edits in reversed(list(hoisted.values())):
+            restore_hoisted(edits)
         for edits in reversed(list(selected.values())):
             revert(edits)
         return tree, []
@@ -1024,7 +1244,10 @@ def restore_try_return_scope(tree, reference, decoder):
                     or not isinstance(block[-2], ast.Try)):
                 continue
             region = block[-2]
-            if region.handlers and not region.orelse and not region.finalbody:
+            handled = region.handlers and not region.orelse and not region.finalbody
+            empty_finally = (not region.handlers and not region.orelse and region.finalbody
+                             and len(region.body) == 1 and isinstance(region.body[0], ast.Pass))
+            if handled or empty_finally:
                 edits.append((block, len(block)-1, region, block[-1]))
         if edits:
             for block, index, region, statement in edits:
@@ -1397,6 +1620,9 @@ def recover(sequence: Path, backend: Path) -> dict:
         tree, report['verified_attribute_callable_values'] = restore_attribute_callable_values(tree, code, transformer)
         tree, report['verified_shared_branch_return_shapes'] = preserve_shared_branch_returns(tree, code, transformer)
         tree, report['verified_shared_try_fragments'] = restore_shared_try_fragments(tree, code, transformer)
+        tree, report['verified_expanded_keyword_merges'] = restore_expanded_keyword_merges(tree, code, transformer)
+        tree, report['verified_chained_comprehension_filters'] = restore_chained_comprehension_filters(tree, code, transformer)
+        tree, report['verified_loop_rejection_guards'] = restore_loop_rejection_guards(tree, code, transformer)
         source = ast.unparse(tree) + '\n'
         if report['verified_shared_return_shapes']:
             lines = []

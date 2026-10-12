@@ -18,6 +18,48 @@ class TryReturnScopeTests(unittest.TestCase):
         recovered = compile_source(ast.unparse(tree), 'owned-recovered')
         return reference, recovered, tree, selected
 
+    def test_empty_finally_body_retains_context_through_await_and_cancellation(self):
+        from contextvars import ContextVar
+        source = '''async def write(writer, origin):
+    token = origin.set('owned')
+    try:
+        return await writer()
+    finally:
+        origin.reset(token)
+'''
+        candidate = source.replace('        return await writer()', '        pass') + '    return await writer()\n'
+        original, recovered, tree, selected = self.recover(source, candidate)
+        self.assertEqual(selected, ['<module>/write#1'])
+        self.assertTrue(compare(original, recovered)['all_units_match'])
+        namespaces = [{}, {}]
+        for code, namespace in zip((original, recovered), namespaces): exec(code, namespace)
+        for failure in ('', 'error', 'cancel'):
+            outputs = []
+            for namespace in namespaces:
+                origin = ContextVar('owned', default='default')
+                calls = []
+                async def writer():
+                    calls.append(origin.get())
+                    await asyncio.sleep(0)
+                    calls.append(origin.get())
+                    if failure == 'error': raise ValueError('write failed')
+                    if failure == 'cancel': raise asyncio.CancelledError('write cancelled')
+                    return 42
+                async def run():
+                    try: outcome = ('value', await namespace['write'](writer, origin))
+                    except (ValueError, asyncio.CancelledError) as error:
+                        outcome = (type(error).__name__, str(error))
+                    return outcome, origin.get(), calls
+                outputs.append(asyncio.run(run()))
+            self.assertEqual(outputs[1], outputs[0])
+            self.assertEqual(outputs[0][1:], ('default', ['owned', 'owned']))
+        self.assertEqual(restore_try_return_scope(tree, original, None)[1], [])
+        for wrong in (candidate.replace('await writer()', 'await writer(1)'),
+                      candidate.replace('origin.reset(token)', 'origin.reset(None)')):
+            _, _, rejected, selections = self.recover(source, wrong)
+            self.assertEqual(selections, [])
+            self.assertEqual(ast.dump(rejected), ast.dump(ast.parse(wrong)))
+
     def test_dict_return_catches_access_errors_inside_original_scope(self):
         reference = '''def summary(fetch):
     try:

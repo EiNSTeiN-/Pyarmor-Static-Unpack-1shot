@@ -52,6 +52,68 @@ class SharedTryFragmentTests(unittest.TestCase):
         recovered = compile_source(ast.unparse(tree), 'owned-recovered')
         return original, recovered, tree, selected
 
+    def test_reunion_and_hoisted_return_are_proved_as_one_trial(self):
+        source = '''async def rows(fetch, convert):
+    try:
+        values = await fetch()
+        return [convert(value) for value in values]
+    except ValueError as error:
+        return 'failed', str(error)
+'''
+        candidate = '''async def rows(fetch, convert):
+    try:
+        values = await fetch()
+    except ValueError as error:
+        return 'failed', str(error)
+    try:
+        pass
+    except ValueError as error:
+        return 'failed', str(error)
+    return [convert(value) for value in values]
+'''
+        original, recovered, tree, selected = self.recover(source, candidate)
+        self.assertEqual(selected, ['<module>/rows#1'])
+        self.assertTrue(compare(original, recovered)['all_units_match'])
+        namespaces = [{}, {}]
+        for code, namespace in zip((original, recovered), namespaces):
+            exec(code, namespace)
+        for failure in ('', 'fetch', 'convert', 'cancel-fetch', 'cancel-convert'):
+            outcomes = []
+            for namespace in namespaces:
+                calls = []
+                async def fetch():
+                    calls.append('fetch')
+                    await asyncio.sleep(0)
+                    if failure == 'fetch': raise ValueError('fetch failed')
+                    if failure == 'cancel-fetch': raise asyncio.CancelledError('fetch cancelled')
+                    return [1, 2, 3]
+                def convert(value):
+                    calls.append(('convert', value))
+                    if failure == 'convert': raise ValueError('conversion failed')
+                    if failure == 'cancel-convert': raise asyncio.CancelledError('conversion cancelled')
+                    return value * 2
+                try: outcome = ('value', asyncio.run(namespace['rows'](fetch, convert)))
+                except asyncio.CancelledError as error: outcome = ('cancelled', str(error))
+                outcomes.append((outcome, calls))
+            self.assertEqual(outcomes[1], outcomes[0])
+        self.assertEqual(restore_shared_try_fragments(tree, original, None)[1], [])
+        variants = (
+            candidate.replace('except ValueError as error:', 'except TypeError as error:', 1),
+            candidate.replace('    try:\n        pass', "    convert('between')\n    try:\n        pass"),
+            candidate.replace("        return 'failed', str(error)\n    try:",
+                              "        return 'failed', str(error)\n    else:\n        convert('else')\n    try:", 1),
+            candidate.replace("        return 'failed', str(error)\n    try:",
+                              "        return 'failed', str(error)\n    finally:\n        convert('finally')\n    try:", 1),
+            candidate.replace('values = await fetch()', 'values = await fetch(1)'),
+        )
+        for wrong in variants:
+            _, _, rejected, selections = self.recover(source, wrong)
+            self.assertEqual(selections, [])
+            self.assertEqual(ast.dump(rejected), ast.dump(ast.parse(wrong)))
+        _, _, unchanged, selections = self.recover(candidate, candidate)
+        self.assertEqual(selections, [])
+        self.assertEqual(ast.dump(unchanged), ast.dump(ast.parse(candidate)))
+
     def test_consecutive_fragments_keep_return_order_and_exact_handler_routes(self):
         original, recovered, tree, selected = self.recover(REFERENCE, FRAGMENTED)
         self.assertEqual(selected, ['<module>/select#1'])
