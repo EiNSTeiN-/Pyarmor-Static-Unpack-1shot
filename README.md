@@ -390,3 +390,9 @@ continue ownership and success-return scope, excluding nested-loop continuations
 These trials require full unit proof and preservation of every prior matched
 unit after unsuccessful neighboring edits are rolled back. They do not widen
 the bytecode verifier's normalization rules.
+
+The 0.4.24 CI pin selects backend 0.6.15, which restores unpacked
+comprehension iterator slots. The complete corpus retains every previous match
+and gains 97 units with the preceding source repairs. The initial 0.6.14
+blanket-cleanup trial was rejected after five regressions despite passing its
+initial tests. Source verification rules remain unchanged.
