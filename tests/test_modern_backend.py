@@ -52,6 +52,38 @@ class ModernBackendTests(native.Python314Tests):
             exec(compile(source, 'recovered_fixture.py', 'exec'), reconstructed)
             return original, reconstructed
 
+    def test_decorated_shared_dictionary_returns_match_through_full_export_pipeline(self):
+        import ast
+        from bytecode_fidelity import compare, compile_source
+        plain = '''def retain(method):
+    return method
+class Owner:
+    def __init__(self, ready):
+        self.ready = ready
+    @property
+    def details(self):
+        return {'ready': self.ready, 'label': 'ready' if self.ready else 'pending'}
+    @staticmethod
+    @retain
+    def describe(ready):
+        return {'label': 'ready' if ready else 'pending'}
+'''
+        tree = ast.parse(plain)
+        for owner in tree.body:
+            if not isinstance(owner, ast.ClassDef): continue
+            for method in owner.body:
+                if not method.decorator_list: continue
+                statement = method.body[0]
+                for _ in range(3):
+                    statement.value = ast.IfExp(ast.Constant(True), statement.value, ast.Constant(None))
+        source = ast.unparse(ast.fix_missing_locations(tree))
+        original, recovered = self.recover(source)
+        self.assertTrue(compare(compile_source(source, 'original'),
+                                compile_source(self.last_generated, 'recovered'))['all_units_match'])
+        for ready in (False, True, None, 0, 1, 'yes'):
+            self.assertEqual(recovered['Owner'](ready).details, original['Owner'](ready).details)
+            self.assertEqual(recovered['Owner'].describe(ready), original['Owner'].describe(ready))
+
     def test_named_nested_helpers_keep_names_and_closure_bindings(self):
         import types
         code = compile('def select(values):\n'

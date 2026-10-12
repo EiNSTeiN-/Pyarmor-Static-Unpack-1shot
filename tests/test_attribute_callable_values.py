@@ -18,6 +18,93 @@ class AttributeCallableValueTests(unittest.TestCase):
         rebuilt = compile_source(ast.unparse(tree), 'owned-recovered')
         return original, rebuilt, tree, selected
 
+    def test_property_callable_lookup_keeps_descriptor_and_argument_failures(self):
+        candidate = '''class Owner:
+    @property
+    def value(self):
+        return self.service.work(self.data)
+'''
+        source = candidate.replace('self.service.work', '(self.service.work if True else None)')
+        original, rebuilt, _, selected = self.recover(source, candidate)
+        self.assertEqual(selected, ['<module>/Owner#1/value#1'])
+        self.assertTrue(compare(original, rebuilt)['all_units_match'])
+        namespaces = [{}, {}]
+        for code, namespace in zip((original, rebuilt), namespaces): exec(code, namespace)
+        for failure in ('', 'service', 'work', 'data', 'call'):
+            outputs = []
+            for namespace in namespaces:
+                events = []
+                class Service:
+                    @property
+                    def work(self):
+                        events.append('work')
+                        if failure == 'work': raise ValueError('owned work')
+                        def call(value):
+                            events.append(('call', value))
+                            if failure == 'call': raise ValueError('owned call')
+                            return value + 1
+                        return call
+                class Owner(namespace['Owner']):
+                    @property
+                    def service(self):
+                        events.append('service')
+                        if failure == 'service': raise ValueError('owned service')
+                        return Service()
+                    @property
+                    def data(self):
+                        events.append('data')
+                        if failure == 'data': raise ValueError('owned data')
+                        return 41
+                try:
+                    result = Owner().value
+                    self.assertEqual(result, 42)
+                except ValueError as error: result = (type(error).__name__, str(error))
+                outputs.append((result, events))
+            self.assertEqual(outputs[1], outputs[0])
+
+    def test_stacked_decorated_coroutine_keeps_joint_shape_and_cancellation(self):
+        candidate = '''def retain(method):
+    return method
+class First:
+    @staticmethod
+    @retain
+    async def select(target, read):
+        value = read()
+        if value is None:
+            value = await target.create(3)
+        elif not value.ready:
+            await value.connect()
+        return value
+class Second:
+    @property
+    def select(self):
+        return 'unchanged'
+'''
+        source = candidate.replace('target.create(3)', '(target.create if True else None)(3)').replace(
+            'return value\n', 'return value if True else None\n')
+        original, rebuilt, _, selected = self.recover(source, candidate)
+        self.assertEqual(selected, ['<module>/First#1/select#1'])
+        self.assertTrue(compare(original, rebuilt)['all_units_match'])
+        namespaces = [{}, {}]
+        for code, namespace in zip((original, rebuilt), namespaces): exec(code, namespace)
+        for cancel in (False, True):
+            outcomes = []
+            for namespace in namespaces:
+                calls = []
+                class Target:
+                    async def create(self, value):
+                        calls.append(value)
+                        await asyncio.sleep(0)
+                        if cancel: raise asyncio.CancelledError('owned cancellation')
+                        return value * 2
+                try:
+                    result = asyncio.run(namespace['First'].select(Target(), lambda: None))
+                    self.assertEqual(result, 6)
+                except asyncio.CancelledError as error: result = (type(error).__name__, str(error))
+                self.assertEqual(namespace['Second']().select, 'unchanged')
+                outcomes.append((result, calls))
+            self.assertEqual(outcomes[1], outcomes[0])
+
     def test_descriptor_getters_and_argument_order_remain_exact(self):
         source = '''def pick(target, read):
     return (target.work if True else None)(read(), extra=read())

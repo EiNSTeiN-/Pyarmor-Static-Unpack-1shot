@@ -1180,7 +1180,10 @@ def restore_attribute_callable_values(tree, reference, decoder):
         if isinstance(node, scopes):
             name = ('<lambda>' if isinstance(node, ast.Lambda) else
                     '<genexpr>' if isinstance(node, ast.GeneratorExp) else node.name)
-            nodes[name, node.lineno].append(node)
+            # Decorated code objects start at the first decorator, not ``def``.
+            decorators = getattr(node, 'decorator_list', ())
+            line = decorators[0].lineno if decorators else node.lineno
+            nodes[name, line].append(node)
     def direct_calls(node):
         for child in ast.iter_child_nodes(node):
             if isinstance(child, scopes): continue
@@ -1287,7 +1290,8 @@ def preserve_shared_branch_returns(tree, reference, decoder):
     nodes = defaultdict(list)
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            nodes[node.name, node.lineno].append(node)
+            line = node.decorator_list[0].lineno if node.decorator_list else node.lineno
+            nodes[node.name, line].append(node)
 
     def returns(node):
         for child in ast.iter_child_nodes(node):

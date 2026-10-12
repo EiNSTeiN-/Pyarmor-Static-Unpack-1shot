@@ -18,6 +18,83 @@ class SharedBranchReturnTests(unittest.TestCase):
         source = ast.unparse(tree)
         return code, source, selected
 
+    def test_property_scope_uses_decorator_line_and_keeps_descriptor_order(self):
+        plain = '''class Owner:
+    @property
+    def details(self) -> dict[str, object]:
+        ready = self.ready
+        return {'data': self.data, 'label': 'ready' if ready else 'pending'}
+'''
+        tree = ast.parse(plain)
+        statement = next(node for node in ast.walk(tree) if isinstance(node, ast.Return))
+        for _ in range(3):
+            statement.value = ast.IfExp(ast.Constant(True), statement.value, ast.Constant(None))
+        reference = ast.unparse(ast.fix_missing_locations(tree))
+        code, source, selected = self.recover(reference, plain)
+        self.assertEqual(selected, ['<module>/Owner#1/details#1'])
+        self.assertTrue(compare(code, compile_source(source, 'candidate'))['all_units_match'])
+        namespaces = [{}, {}]
+        for compiled, namespace in zip((code, compile_source(source, 'candidate')), namespaces):
+            exec(compiled, namespace)
+        for ready in (False, True, None, 0, 'yes'):
+            for failure in ('', 'ready', 'data'):
+                outcomes = []
+                for namespace in namespaces:
+                    events = []
+                    class Owner(namespace['Owner']):
+                        @property
+                        def ready(self):
+                            events.append('ready')
+                            if failure == 'ready': raise ValueError('owned ready')
+                            return ready
+                        @property
+                        def data(self):
+                            events.append('data')
+                            if failure == 'data': raise ValueError('owned data')
+                            return 42
+                    try:
+                        result = Owner().details
+                        self.assertEqual(result, {'data': 42, 'label': 'ready' if ready else 'pending'})
+                    except ValueError as error:
+                        result = (type(error).__name__, str(error))
+                    outcomes.append((result, events))
+                self.assertEqual(outcomes[1], outcomes[0])
+
+    def test_stacked_decorators_duplicate_names_and_unproven_neighbors_are_isolated(self):
+        plain = '''def retain(method):
+    return method
+class First:
+    @staticmethod
+    @retain
+    def describe(ready):
+        return {'label': 'ready' if ready else 'pending'}
+class Second:
+    @property
+    def describe(self):
+        return 'original'
+'''
+        tree = ast.parse(plain)
+        owner = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'First')
+        statement = owner.body[0].body[0]
+        for _ in range(3):
+            statement.value = ast.IfExp(ast.Constant(True), statement.value, ast.Constant(None))
+        reference = ast.unparse(ast.fix_missing_locations(tree))
+        for candidate in (plain, plain.replace("return 'original'", "return 'wrong'")):
+            code, source, selected = self.recover(reference, candidate)
+            self.assertEqual(selected, ['<module>/First#1/describe#1'])
+            report = compare(code, compile_source(source, 'candidate'))
+            wrong = "return 'wrong'" in candidate
+            self.assertEqual(report['all_units_match'], not wrong)
+            if wrong: self.assertIn("return 'wrong'", source)
+            namespace = {}
+            exec(compile_source(source, 'candidate'), namespace)
+            self.assertEqual(namespace['First'].describe(True), {'label': 'ready'})
+            self.assertEqual(namespace['First'].describe(False), {'label': 'pending'})
+            repaired, again = preserve_shared_branch_returns(ast.parse(source), code, None)
+            self.assertEqual(again, [])
+            self.assertEqual(ast.dump(repaired, include_attributes=False),
+                             ast.dump(ast.parse(source), include_attributes=False))
+
     def test_keyword_call_tail_preserves_properties_arguments_and_errors(self):
         plain = '''def describe(owner, first, second):
     data = owner.data

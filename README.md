@@ -183,6 +183,13 @@ restores all failed neighboring edits. Owned fixtures verify reconnect versus
 creation, descriptor lookup, argument order, errors, cancellation and nested
 scope isolation. Wrong arguments, receivers or branch conditions still fail.
 
+Source-scope lookup uses the first decorator's line for decorated functions,
+matching CPython's code-object location. Using the ``def`` line silently skipped
+property, static and class methods in the callable and branch-return passes.
+Owned fixtures check descriptors, stacked decorators, coroutine cancellation,
+duplicate method names, unproven neighbors and full native-export recovery.
+The mapping correction does not change comparison or exception-handler rules.
+
 Python 3.14 may also create a module's conditional-annotation set implicitly.
 An explicit guessed empty dictionary in generated source would overwrite that
 real binding. The source pass removes it only when the entire module unit then
