@@ -612,6 +612,81 @@ def restore_module_annotation_binding(tree, reference, decoder):
     return tree, False
 
 
+def restore_try_return_scope(tree, reference, decoder):
+    """Restore a hoisted final return only after exact exception-dispatch proof."""
+    try:
+        from .bytecode_fidelity import compare, compile_source, units
+    except ImportError:
+        from bytecode_fidelity import compare, compile_source, units
+
+    class Definitions(ast.NodeVisitor):
+        def __init__(self):
+            self.prefix = ''
+            self.nodes = defaultdict(list)
+        def visit_ClassDef(self, node):
+            previous = self.prefix
+            self.prefix += node.name + '.'
+            self.generic_visit(node)
+            self.prefix = previous
+        def visit_FunctionDef(self, node):
+            name = self.prefix + node.name
+            self.nodes[name].append(node)
+            previous = self.prefix
+            self.prefix = name + '.<locals>.'
+            self.generic_visit(node)
+            self.prefix = previous
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+    def check():
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', SyntaxWarning)
+            candidate = compile_source(ast.unparse(ast.fix_missing_locations(tree)), '<try-scope-candidate>')
+        return candidate, compare(reference, candidate, decoder)
+
+    candidate, before = check()
+    matched_before = {entry['unit'] for entry in before['entries'] if entry['matched']}
+    failed = {entry['unit'] for entry in before['entries'] if entry['reason'] == 'exception_table'}
+    if not failed:
+        return tree, []
+    by_name = defaultdict(list)
+    for path, code in units(candidate):
+        by_name[code.co_qualname].append(path)
+    definitions = Definitions()
+    definitions.visit(tree)
+    attempted = {}
+    for name, nodes in definitions.nodes.items():
+        if len(nodes) != 1 or len(by_name[name]) != 1 or by_name[name][0] not in failed:
+            continue
+        node = nodes[0]
+        if (len(node.body) < 2 or not isinstance(node.body[-1], ast.Return)
+                or not isinstance(node.body[-2], ast.Try)):
+            continue
+        region = node.body[-2]
+        if not region.handlers or region.orelse or region.finalbody:
+            continue
+        region.body.append(node.body.pop())
+        attempted[by_name[name][0]] = (node, region)
+    if not attempted:
+        return tree, []
+    _, tentative = check()
+    matching = {entry['unit'] for entry in tentative['entries'] if entry['matched']}
+    selected = {}
+    for path, (node, region) in attempted.items():
+        if path in matching:
+            selected[path] = (node, region)
+        else:
+            node.body.append(region.body.pop())
+    if not selected:
+        return tree, []
+    _, final = check()
+    after = {entry['unit'] for entry in final['entries'] if entry['matched']}
+    if not matched_before.issubset(after) or not set(selected).issubset(after):
+        for node, region in selected.values():
+            node.body.append(region.body.pop())
+        return tree, []
+    return tree, sorted(selected)
+
+
 def preserve_shared_returns(tree, reference, decoder):
     """Retain a compiler shared-return shape only after exact unit proof.
 
@@ -747,6 +822,7 @@ def recover(sequence: Path, backend: Path) -> dict:
             tree = ast.fix_missing_locations(FutureAnnotationNormalizer().visit(tree))
         tree, report['verified_module_annotation_binding'] = restore_module_annotation_binding(tree, code, transformer)
         tree, report['verified_shared_return_shapes'] = preserve_shared_returns(tree, code, transformer)
+        tree, report['verified_try_return_scopes'] = restore_try_return_scope(tree, code, transformer)
         source = ast.unparse(tree) + '\n'
         if report['verified_shared_return_shapes']:
             lines = []

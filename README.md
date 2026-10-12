@@ -121,6 +121,14 @@ significant in the verifier. Owned tests compare the compiler set, annotation
 dictionary and other exported bindings and keep genuine explicit assignments.
 The recovery report records `verified_module_annotation_binding`.
 
+A result-building final return can also be hoisted past the handler that
+originally covered it. The scope repair moves it back into the preceding try
+body only after the complete code unit matches, including every exception
+range, target, stack depth and lasti flag. It rejects unproven changes and
+checks that no old match is lost. Existing outside returns and finally suites
+are preserved. Owned fixtures exercise handled access/conversion errors and
+coroutine cancellation. Accepted paths appear in `verified_try_return_scopes`.
+
 Run the original-fixture regression tests with:
 
 ```bash
