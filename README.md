@@ -31,6 +31,9 @@ The pinned backend also preserves independent for-loop rejection guards, so a
 return cannot escape the guard that assigned its value. Owned bytecode/behavior
 checks include invalid rows, None and false values, getter order and identity
 tests that must not invoke user truth conversion.
+Negated comparison guards retain their original operator and invert the truth
+jump instead; NaN and user rich comparisons must not be changed by folding
+`not (value < limit)` into `value >= limit`.
 
 The normalizer resolves closure cells by capture position, preserves genuine
 exception cleanup directly before an exit marker, and reconstructs future
