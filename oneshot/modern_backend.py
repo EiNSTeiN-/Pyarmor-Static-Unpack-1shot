@@ -838,7 +838,7 @@ def restore_compound_return_shapes(tree, reference, decoder):
 
 
 def restore_try_return_scope(tree, reference, decoder):
-    """Restore a hoisted final return only after exact exception-dispatch proof."""
+    """Restore hoisted block-tail returns only after exact dispatch proof."""
     try:
         from .bytecode_fidelity import compare, compile_source, units
     except ImportError:
@@ -882,36 +882,54 @@ def restore_try_return_scope(tree, reference, decoder):
         by_name[code.co_qualname].append(path)
     definitions = Definitions()
     definitions.visit(tree)
+    def statement_blocks(node):
+        for _, value in ast.iter_fields(node):
+            if isinstance(value, list) and value and isinstance(value[0], ast.stmt):
+                yield value
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            yield from statement_blocks(child)
+
+    def revert(edits):
+        for block, index, region, statement in reversed(edits):
+            region.body.remove(statement)
+            block.insert(index, statement)
+
     attempted = {}
     for name, nodes in definitions.nodes.items():
         if len(nodes) != 1 or len(by_name[name]) != 1 or by_name[name][0] not in failed:
             continue
-        node = nodes[0]
-        if (len(node.body) < 2 or not isinstance(node.body[-1], ast.Return)
-                or not isinstance(node.body[-2], ast.Try)):
-            continue
-        region = node.body[-2]
-        if not region.handlers or region.orelse or region.finalbody:
-            continue
-        region.body.append(node.body.pop())
-        attempted[by_name[name][0]] = (node, region)
+        edits = []
+        for block in statement_blocks(nodes[0]):
+            if (len(block) < 2 or not isinstance(block[-1], ast.Return)
+                    or not isinstance(block[-2], ast.Try)):
+                continue
+            region = block[-2]
+            if region.handlers and not region.orelse and not region.finalbody:
+                edits.append((block, len(block)-1, region, block[-1]))
+        if edits:
+            for block, index, region, statement in edits:
+                block.remove(statement)
+                region.body.append(statement)
+            attempted[by_name[name][0]] = edits
     if not attempted:
         return tree, []
     _, tentative = check()
     matching = {entry['unit'] for entry in tentative['entries'] if entry['matched']}
     selected = {}
-    for path, (node, region) in attempted.items():
+    for path, edits in attempted.items():
         if path in matching:
-            selected[path] = (node, region)
+            selected[path] = edits
         else:
-            node.body.append(region.body.pop())
+            revert(edits)
     if not selected:
         return tree, []
     _, final = check()
     after = {entry['unit'] for entry in final['entries'] if entry['matched']}
     if not matched_before.issubset(after) or not set(selected).issubset(after):
-        for node, region in selected.values():
-            node.body.append(region.body.pop())
+        for edits in selected.values():
+            revert(edits)
         return tree, []
     return tree, sorted(selected)
 

@@ -123,6 +123,19 @@ hooks, closures, generators and coroutines and reject different constants,
 parameters and handler types. The recovery report lists exactly the accepted
 unit paths in `verified_shared_return_shapes`.
 
+The existing jump-to-bare-return comparison also accounts for the original
+forward jump's own non-`lasti` exception-table slot. That slot contains no
+fallible evaluation. Coverage over real returns, calls, other instructions,
+backward jumps and cleanup/StopIteration routes remains significant. Owned
+bytecode fixtures preserve callback/identity/truth/error behavior and coroutine
+cancellation, and reject changed call coverage, handler types, stack depths,
+literals and intervening work. See Python's [forward/backward jump documentation](https://docs.python.org/3.14/library/dis.html#opcode-JUMP_FORWARD).
+The source scope repair now also finds hoisted returns at nested block tails;
+each whole function must match before any move is retained, and nested
+definitions are proved independently. Nested row fallback/getter and loop
+fixtures cover these cases. This does not permit ignoring a handler over a
+call or moving arbitrary work between handlers.
+
 The related branch-return pass tries at most four constant-folded layers around
 existing returns, including returns inside rejection guards. This preserves
 some shared keyword-call or dictionary tails that one folded layer cannot

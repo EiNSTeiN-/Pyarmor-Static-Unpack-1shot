@@ -24,7 +24,7 @@
 #include "ASTree.h"
 #include "pyc_export.h"
 
-const char* VERSION = "v0.4.18-einstein.1";
+const char* VERSION = "v0.4.19-einstein.1";
 
 bool unstableTryBlocksEnabled = false;
 

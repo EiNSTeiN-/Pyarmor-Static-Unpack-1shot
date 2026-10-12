@@ -255,30 +255,45 @@ def canonical(code, decoder=None):
         if inverse:
             ops[index] = ('IS_OP', 0)
             ops[index + 1] = (inverse, destination)
-    exceptions = []
-    for entry in dis.Bytecode(code).exception_entries:
-        region = (position(entry.start), position(entry.end), position(entry.target), entry.depth, entry.lasti)
-        if region[0] == region[1]:
-            continue
-        # Adjacent ranges with the same handler have exactly the same dispatch
-        # map as one range. Padding and removed runtime layers can split them.
-        # Never merge across a meaningful instruction or a different handler.
-        if exceptions and exceptions[-1][1] == region[0] and exceptions[-1][2:] == region[2:]:
-            previous = exceptions[-1]
-            exceptions[-1] = (previous[0], region[1], *region[2:])
-        else:
-            exceptions.append(region)
-    exceptions = tuple(exceptions)
-    parameters = code.co_argcount + code.co_kwonlyargcount
-    parameters += bool(code.co_flags & 4) + bool(code.co_flags & 8)
-    # PyArmor return epilogues can leave a jump to a shared RETURN_VALUE
-    # where the ordinary compiler emits RETURN_VALUE directly. It is the
-    # same terminator only when the destination contains no intervening work.
+    # Complete the existing shared-return alias rule before comparing handler
+    # ranges. A forward jump directly to a bare RETURN_VALUE contains no user
+    # operation or backward-jump interrupt check. Its own non-lasti dispatch
+    # slot is return plumbing, not a protected evaluation. Keep every other
+    # instruction's handler, depth and lasti significant, including real
+    # RETURN_VALUE slots and all generator/exception cleanup coverage.
+    return_aliases = set()
     for index, (name, operand) in enumerate(ops):
         if name == 'JUMP' and operand[0] == 'target':
             target = operand[1]
             if target < len(ops) and ops[target][0] == 'RETURN_VALUE':
                 ops[index] = ('RETURN_VALUE', None)
+                if index < target:
+                    return_aliases.add(index)
+    exceptions = []
+    for entry in dis.Bytecode(code).exception_entries:
+        region = (position(entry.start), position(entry.end), position(entry.target), entry.depth, entry.lasti)
+        segments = []
+        start = region[0]
+        for index in sorted(return_aliases):
+            if entry.lasti or not region[0] <= index < region[1]:
+                continue
+            if start < index:
+                segments.append((start, index, *region[2:]))
+            start = index + 1
+        if start < region[1]:
+            segments.append((start, region[1], *region[2:]))
+        for region in segments:
+            # Adjacent ranges with the same handler have exactly the same
+            # dispatch map. Never merge across a meaningful instruction or a
+            # different handler; the alias slot remains a deliberate gap.
+            if exceptions and exceptions[-1][1] == region[0] and exceptions[-1][2:] == region[2:]:
+                previous = exceptions[-1]
+                exceptions[-1] = (previous[0], region[1], *region[2:])
+            else:
+                exceptions.append(region)
+    exceptions = tuple(exceptions)
+    parameters = code.co_argcount + code.co_kwonlyargcount
+    parameters += bool(code.co_flags & 4) + bool(code.co_flags & 8)
     docstring = constant(code.co_consts[0]) if code.co_flags & 67108864 else None
     signature = (code.co_argcount, code.co_posonlyargcount, code.co_kwonlyargcount,
                  code.co_flags, tuple(code.co_varnames[:parameters]),
