@@ -27,6 +27,10 @@ validation from structural warnings. `complete: true` means no structural issue
 was reported; it does **not** establish behavioral equivalence. Keep `.das`,
 `.recovered.pyc`, and `.modern.raw.py` for comparison. Sequence files contain
 runtime AES material and should remain private.
+The pinned backend also preserves independent for-loop rejection guards, so a
+return cannot escape the guard that assigned its value. Owned bytecode/behavior
+checks include invalid rows, None and false values, getter order and identity
+tests that must not invoke user truth conversion.
 
 The normalizer resolves closure cells by capture position, preserves genuine
 exception cleanup directly before an exit marker, and reconstructs future
