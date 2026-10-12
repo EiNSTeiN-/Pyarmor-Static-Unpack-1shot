@@ -119,6 +119,46 @@ class ModernBackendTests(native.Python314Tests):
         self.assertEqual(reconstructed['Result'].__doc__, original['Result'].__doc__)
         self.assertEqual(reconstructed['Result'].__annotations__, original['Result'].__annotations__)
 
+    def test_unused_future_annotation_cell_preserves_dataclass_namespace(self):
+        original, reconstructed = self.recover(
+            'from __future__ import annotations\n'
+            'from dataclasses import dataclass\n'
+            '@dataclass\nclass Result:\n    "Documented result."\n'
+            '    if False:\n        discarded: int\n'
+            '    amount: int\n    valid: bool = True\n')
+        for name in ('__doc__', '__annotations__', '__match_args__'):
+            self.assertEqual(getattr(reconstructed['Result'], name), getattr(original['Result'], name))
+        self.assertEqual(reconstructed['Result'](3).__dict__, original['Result'](3).__dict__)
+        self.assertNotIn('__conditional_annotations__', reconstructed['Result'].__dict__)
+        self.assertNotIn('__conditional_annotations__', self.last_generated)
+        from bytecode_fidelity import compare
+        reference = compile('from __future__ import annotations\nfrom dataclasses import dataclass\n'
+                            '@dataclass\nclass Result:\n    "Documented result."\n'
+                            '    if False:\n        discarded: int\n'
+                            '    amount: int\n    valid: bool = True\n',
+                            'fixture.py', 'exec', dont_inherit=True)
+        self.assertTrue(compare(reference, compile(self.last_generated, 'candidate.py', 'exec',
+                                                  dont_inherit=True))['all_units_match'])
+
+    def test_explicit_annotation_bookkeeping_attribute_is_preserved(self):
+        original, reconstructed = self.recover(
+            'from __future__ import annotations\n'
+            'class Result:\n    "Documented result."\n'
+            '    __conditional_annotations__ = {"public": 4}\n    amount: int\n')
+        self.assertEqual(reconstructed['Result'].__conditional_annotations__,
+                         original['Result'].__conditional_annotations__)
+
+    def test_joined_runtime_initializer_keeps_the_user_store(self):
+        source = 'class Result:\n    def __init__(self):\n'
+        source += '        __assert_armored__ = "__pyarmor_assert_fixture__"\n        self.samples = {}\n'
+        original, reconstructed = self.recover(source)
+        self.assertEqual(reconstructed['Result']().__dict__, original['Result']().__dict__)
+        self.assertNotIn('__assert_armored__', self.last_generated)
+        from bytecode_fidelity import compare
+        self.assertTrue(compare(compile(source, 'reference.py', 'exec', dont_inherit=True),
+                                compile(self.last_generated, 'candidate.py', 'exec',
+                                        dont_inherit=True))['all_units_match'])
+
     def test_generator_builtin_fast_paths(self):
         for name in ('all', 'any', 'tuple'):
             original, reconstructed = self.recover(
@@ -170,6 +210,49 @@ class ModernBackendTests(native.Python314Tests):
 
 
 class NormalizationTests(unittest.TestCase):
+    def test_parallel_marker_removal_preserves_rhs_then_target_order(self):
+        import ast
+        source = ('target.first, __assert_armored__, target.second = '
+                  '(read("first"), "__pyarmor_assert_fixture__", read("second"))\n')
+        tree = ast.fix_missing_locations(MarkerNormalizer(bytes(16), bytes(12)).visit(ast.parse(source)))
+        observed = []
+        class Target:
+            def __setattr__(self, name, value):
+                observed.append(('store', name, value))
+        def read(name):
+            observed.append(('read', name))
+            return name
+        exec(compile(tree, 'owned.py', 'exec'), {'target': Target(), 'read': read})
+        self.assertEqual(observed, [('read', 'first'), ('read', 'second'),
+                                    ('store', 'first', 'first'), ('store', 'second', 'second')])
+        self.assertNotIn('__assert_armored__', ast.unparse(tree))
+        untouched = 'target.first, __assert_armored__ = (read("first"), "user value")\n'
+        tree = MarkerNormalizer(bytes(16), bytes(12)).visit(ast.parse(untouched))
+        self.assertIn('__assert_armored__', ast.unparse(tree))
+    @unittest.skipUnless(sys.version_info[:2] == (3, 14), 'Requires CPython 3.14')
+    def test_wide_exit_jump_drops_only_its_argument_prefix(self):
+        import dis
+        import types
+        code = compile('def select():\n    return 7\n', 'fixture.py', 'exec', dont_inherit=True)
+        function = next(value for value in code.co_consts if isinstance(value, types.CodeType))
+        ret = next(item for item in dis.get_instructions(function) if item.opname == 'RETURN_VALUE')
+        # More than 255 words to the recognized runtime exit requires a
+        # prefix. The original value stays on the stack across that jump.
+        padding = bytes((dis.opmap['NOP'], 0)) * 300
+        suffix = bytes((dis.opmap['LOAD_CONST'], len(function.co_consts),
+                        dis.opmap['PUSH_NULL'], 0, dis.opmap['LOAD_CONST'], 0,
+                        dis.opmap['CALL'], 1)) + bytes(6) + bytes((dis.opmap['POP_TOP'], 0,
+                            dis.opmap['RETURN_VALUE'], 0))
+        jump = bytes((dis.opmap['EXTENDED_ARG'], 1, dis.opmap['JUMP_FORWARD'], 44))
+        protected = function.replace(co_code=function.co_code[:ret.offset] + jump + padding + suffix,
+                                     co_consts=function.co_consts + ('__pyarmor_exit_fixture__',))
+        normalized = normalize_code(protected)
+        instructions = list(dis.get_instructions(normalized))
+        self.assertEqual(normalized.co_code[ret.offset:ret.offset+2], bytes((dis.opmap['NOP'], 0)))
+        self.assertEqual(next(item for item in instructions if item.opname == 'RETURN_VALUE').arg, None)
+        self.assertEqual(len(normalized.co_code), len(protected.co_code))
+        self.assertEqual(types.FunctionType(normalized, {})(), 7)
+
     @unittest.skipUnless(sys.version_info[:2] == (3, 14), 'Requires CPython 3.14')
     def test_runtime_entry_restores_frame_visibility_for_zero_argument_super(self):
         import builtins

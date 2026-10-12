@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: EiNSTeiN-/pycdc-modern
-          ref: f2b27217fc5c8a0f83abb3a7d889ea8318c433c1
+          ref: ed8c5d407e148ae160632f0363a05f2399836dd7
           path: modern
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1

@@ -23,9 +23,9 @@ import types
 import warnings
 
 try:
-    from .modern_backend import MarkerNormalizer, normalize_code
+    from .modern_backend import MarkerNormalizer, normalize_code, unused_future_annotation_offsets
 except ImportError:
-    from modern_backend import MarkerNormalizer, normalize_code
+    from modern_backend import MarkerNormalizer, normalize_code, unused_future_annotation_offsets
 
 
 PADDING = frozenset(('NOP', 'CACHE', 'EXTENDED_ARG', 'NOT_TAKEN', 'RESUME'))
@@ -89,6 +89,11 @@ def canonical(code, decoder=None):
     """Apply an explicit, narrow whitelist; keep control flow and handlers."""
     original = [item for item in dis.get_instructions(code) if item.opname not in PADDING]
     removed, replacements, unresolved = set(), {}, []
+    # A sole private compiler annotation cell with no reads/captures cannot
+    # affect the class namespace or annotation values. The source must not
+    # invent a public attribute for it. Used cells and public stores remain.
+    unused_annotation = set(unused_future_annotation_offsets(code))
+    removed.update(index for index, item in enumerate(original) if item.offset in unused_annotation)
 
     # CPython 3.13+ stores class source locations in the compiler header as
     # well as co_firstlineno. Formatting changes may alter only that header
@@ -264,7 +269,7 @@ def canonical(code, decoder=None):
     docstring = constant(code.co_consts[0]) if code.co_flags & 67108864 else None
     signature = (code.co_argcount, code.co_posonlyargcount, code.co_kwonlyargcount,
                  code.co_flags, tuple(code.co_varnames[:parameters]),
-                 len(code.co_freevars), len(code.co_cellvars), docstring)
+                 len(code.co_freevars), len(code.co_cellvars) - bool(unused_annotation), docstring)
     return CanonicalCode(signature, tuple(ops), exceptions, tuple(unresolved))
 
 

@@ -51,6 +51,14 @@ The standard initial `RESUME 0` is restored at its known entry slot when the
 native entry hook is removed. This makes ordinary frame lookup and
 zero-argument `super()` work in the recovered method; an inheritance fixture
 checks the constructor against its plain original code.
+When a wide jump to an exit marker becomes an operandless return, its argument
+prefixes are removed too. Instruction addresses remain stable. A fixture
+executes the resulting return, and the corpus audit checks nested-unit recovery.
+
+Source cleanup retains ordinary stores joined with a runtime marker initializer
+in a parallel assignment. Only the paired marker literal is removed; remaining
+RHS expressions still run before target stores. Owned tests check attribute
+write ordering and a recovered constructor's complete bytecode tree.
 
 A separate static verifier compares nested code units and keeps unsupported
 marker patterns as failures:
@@ -70,6 +78,13 @@ Compiler-generated class `__firstlineno__` values are location metadata, just
 like code-object line numbers. Only the recognized class header is normalized;
 an explicit assignment in the class body remains significant and is covered
 by a negative regression test.
+A sole future-annotation class cell is compiler bookkeeping only when its
+complete bytecode has no reads, captures or public namespace binding and only
+the recognized empty-set initialization. Its three setup instructions and cell
+count can then be omitted from comparison, and the source initializer is
+removed using the original class metadata. This restores the class docstring
+and avoids inventing a public attribute. Used cells and explicit attributes
+remain significant; owned tests cover dataclass fields and namespace behavior.
 
 Run the original-fixture regression tests with:
 

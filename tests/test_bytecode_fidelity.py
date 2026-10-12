@@ -8,11 +8,32 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'oneshot'))
 from bytecode_fidelity import compare, compile_source, constant
-from modern_backend import MarkerNormalizer, _varint
+from modern_backend import MarkerNormalizer, _varint, unused_future_annotation_offsets
 
 
 @unittest.skipUnless(sys.version_info[:2] == (3, 14), 'Requires CPython 3.14')
 class FidelityTests(unittest.TestCase):
+    def test_unused_future_annotation_cell_is_only_compiler_bookkeeping(self):
+        source = 'from __future__ import annotations\nclass Result:\n    "Documented."\n'
+        reference = compile_source(source + '    if False:\n        unused: int\n    amount: int\n', 'reference.py')
+        candidate = compile_source(source + '    amount: int\n', 'candidate.py')
+        self.assertTrue(compare(reference, candidate)['all_units_match'])
+        changed = compile_source(source + '    amount: str\n', 'changed.py')
+        self.assertFalse(compare(reference, changed)['all_units_match'])
+
+    def test_observable_conditional_annotation_cells_are_not_removed(self):
+        source = 'from __future__ import annotations\nclass Result:\n'
+        for body in ('    if False:\n        unused: int\n    saved = __conditional_annotations__\n',
+                     '    if False:\n        unused: int\n    __conditional_annotations__ = {"public": 3}\n'):
+            module = compile_source(source + body, 'observable.py')
+            code = next(item for item in module.co_consts if isinstance(item, types.CodeType))
+            self.assertFalse(unused_future_annotation_offsets(code))
+        # Deferred PEP 649 annotations capture and read the cell, even when
+        # a literal condition lets the compiler fold the executable branch.
+        module = compile_source('class Result:\n    if False:\n        unused: int\n', 'deferred.py')
+        code = next(item for item in module.co_consts if isinstance(item, types.CodeType))
+        self.assertFalse(unused_future_annotation_offsets(code))
+
     def test_compiler_class_source_line_is_location_metadata(self):
         source = 'class Result:\n    "Documented class."\n    value = 3\n'
         self.assertTrue(self.check(source, '\n\n' + source)['all_units_match'])

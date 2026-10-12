@@ -240,9 +240,17 @@ def normalize_code(code: types.CodeType) -> types.CodeType:
             if end is not None:
                 for offset in range(instruction.offset, end + 2, 2):
                     bytecode[offset:offset + 2] = bytes((dis.opmap['NOP'], 0))
-    for instruction in instructions:
+    for index, instruction in enumerate(instructions):
         if instruction.opname == 'JUMP_FORWARD' and instruction.argval in exits:
             bytecode[instruction.offset:instruction.offset + 2] = bytes((dis.opmap['RETURN_VALUE'], 0))
+            # RETURN_VALUE has no operand. A wide exit jump's prefix must
+            # not survive as an orphan argument extension before the return.
+            # Keep all addresses stable so jumps and handlers still align.
+            previous = index - 1
+            while previous >= 0 and instructions[previous].opname == 'EXTENDED_ARG':
+                offset = instructions[previous].offset
+                bytecode[offset:offset + 2] = bytes((dis.opmap['NOP'], 0))
+                previous -= 1
     entries = restore_stop_iteration_routes(code, instructions,
                                            list(dis.Bytecode(code).exception_entries), exits)
     entries = [entry for entry in entries if entry.target not in exits]
@@ -288,6 +296,79 @@ def normalize_code(code: types.CodeType) -> types.CodeType:
         table.extend(_varint((entry.depth << 1) | entry.lasti))
     return code.replace(co_code=bytes(bytecode), co_consts=constants,
                         co_exceptiontable=bytes(table))
+
+
+def unused_future_annotation_offsets(code: types.CodeType) -> tuple[int, ...]:
+    """Identify an inaccessible, unused compiler cell in a future-annotated class.
+
+    Conditional annotations can leave a set cell even when the compiler drops
+    their guarded stores. It is not a class attribute. Keep every observable
+    use, capture, additional cell, and explicit namespace binding significant.
+    """
+    if (code.co_name == '<module>' or code.co_flags & 1
+            or not code.co_flags & 16777216 or code.co_freevars
+            or code.co_cellvars != ('__conditional_annotations__',)):
+        return ()
+    instructions = [item for item in dis.get_instructions(code)
+                    if item.opname not in ('NOP', 'CACHE', 'EXTENDED_ARG', 'NOT_TAKEN', 'RESUME')]
+    uses = [(index, item) for index, item in enumerate(instructions)
+            if item.argval == '__conditional_annotations__']
+    if len(uses) != 2:
+        return ()
+    (make_index, make), (store_index, store) = uses
+    if (make_index != 0 or make.opname != 'MAKE_CELL'
+            or store.opname != 'STORE_DEREF' or store_index == 0):
+        return ()
+    initializer = instructions[store_index - 1]
+    if initializer.opname != 'BUILD_SET' or initializer.arg != 0:
+        return ()
+    return make.offset, initializer.offset, store.offset
+
+
+class ClassAnnotationNormalizer(ast.NodeTransformer):
+    """Remove only class-cell initializers proven private and unused by bytecode."""
+
+    def __init__(self, code: types.CodeType):
+        self.qualifier = ''
+        candidates = {}
+
+        def collect(unit):
+            candidates.setdefault(unit.co_qualname, []).append(unit)
+            for value in unit.co_consts:
+                if isinstance(value, types.CodeType):
+                    collect(value)
+
+        collect(code)
+        self.unused = {name for name, values in candidates.items()
+                       if len(values) == 1 and unused_future_annotation_offsets(values[0])}
+
+    def qualified(self, name):
+        return self.qualifier + name
+
+    def visit_FunctionDef(self, node):
+        previous = self.qualifier
+        self.qualifier = self.qualified(node.name) + '.<locals>.'
+        node = self.generic_visit(node)
+        self.qualifier = previous
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node):
+        previous = self.qualifier
+        name = self.qualified(node.name)
+        self.qualifier = name + '.'
+        node = self.generic_visit(node)
+        self.qualifier = previous
+        if name in self.unused and node.body:
+            first = node.body[0]
+            if (isinstance(first, ast.Assign) and len(first.targets) == 1
+                    and isinstance(first.targets[0], ast.Name)
+                    and first.targets[0].id == '__conditional_annotations__'
+                    and isinstance(first.value, (ast.Dict, ast.Set))
+                    and not (first.value.keys if isinstance(first.value, ast.Dict) else first.value.elts)):
+                node.body.pop(0)
+        return node
 
 
 class MarkerNormalizer(ast.NodeTransformer):
@@ -358,6 +439,26 @@ class MarkerNormalizer(ast.NodeTransformer):
 
     def visit_Assign(self, node):
         node = self.generic_visit(node)
+        # The source backend can join a marker initializer and ordinary
+        # stores into one parallel assignment. Remove only the paired marker
+        # literal. Keep the remaining parallel assignment so every RHS still
+        # runs before any target store, including observable attribute writes.
+        if (len(node.targets) == 1 and isinstance(node.targets[0], (ast.Tuple, ast.List))
+                and isinstance(node.value, (ast.Tuple, ast.List))
+                and len(node.targets[0].elts) == len(node.value.elts)):
+            pairs = list(zip(node.targets[0].elts, node.value.elts))
+            remaining = [(target, value) for target, value in pairs
+                         if not (isinstance(target, ast.Name) and target.id == '__assert_armored__'
+                                 and isinstance(value, ast.Constant) and isinstance(value.value, str)
+                                 and value.value.startswith('__pyarmor_assert_'))]
+            if len(remaining) != len(pairs):
+                if not remaining:
+                    return None
+                targets, values = zip(*remaining)
+                if len(remaining) == 1:
+                    return ast.copy_location(ast.Assign([targets[0]], values[0]), node)
+                return ast.copy_location(ast.Assign([ast.Tuple(list(targets), ast.Store())],
+                                                    ast.Tuple(list(values), ast.Load())), node)
         if (len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
                 and node.targets[0].id == '__assert_armored__'
                 and isinstance(node.value, ast.Constant)
@@ -484,7 +585,8 @@ def recover(sequence: Path, backend: Path) -> dict:
         if len(metadata) != 34 or metadata[0] != 0xa1 or metadata[17] != 0xa2:
             raise ValueError('Missing AES metadata in sequence')
         transformer = MarkerNormalizer(metadata[1:17], metadata[18:30])
-        tree = ast.fix_missing_locations(DeadTailNormalizer().visit(transformer.visit(tree)))
+        tree = ast.fix_missing_locations(DeadTailNormalizer().visit(
+            ClassAnnotationNormalizer(code).visit(transformer.visit(tree))))
         if any(isinstance(statement, ast.ImportFrom) and statement.module == '__future__'
                and any(alias.name == 'annotations' for alias in statement.names)
                for statement in tree.body):
