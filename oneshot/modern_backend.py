@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 from collections import defaultdict
+import copy
 import dis
 import heapq
 import importlib.util
@@ -800,6 +801,320 @@ def _function_nodes(owner):
         if not isinstance(child, scopes):
             yield child
             yield from _function_nodes(child)
+
+
+def _statement_suites(owner):
+    """Yield statement lists in one code scope, including handler/else suites."""
+    for node in (owner, *_function_nodes(owner)):
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, list) and value and all(isinstance(item, ast.stmt) for item in value):
+                yield node, field, value
+
+
+def _fold_value(value, depth):
+    value = value if value is not None else ast.Constant(None)
+    for _ in range(depth):
+        value = ast.IfExp(ast.Constant(True), value, ast.Constant(None))
+    return value
+
+
+def _fold_return_statements(owner, depth, selected=None):
+    """Retain statement return edges without moving their values into a try."""
+    returns = [node for node in _function_nodes(owner) if isinstance(node, ast.Return)]
+    wanted = {id(node) for index, node in enumerate(returns) if selected is None or index == selected}
+    for parent, field, suite in reversed(list(_statement_suites(owner))):
+        replacement = []
+        for statement in suite:
+            if id(statement) in wanted:
+                for _ in range(depth):
+                    statement = ast.If(ast.Constant(True), [statement], [])
+            replacement.append(statement)
+        setattr(parent, field, replacement)
+
+
+def _prove_function_trials(tree, reference, decoder, trials):
+    """Prove bounded single-scope shape trials, then retain the whole module.
+
+    Only source shapes change. Each accepted owner and every nested unit must
+    match the original instructions AND exception dispatch. Failed trials are
+    restored before the next one; a final module comparison protects matching
+    neighbors and capture users. The comparator's rules are never relaxed.
+    """
+    try:
+        from .bytecode_fidelity import compare, compile_source, units
+    except ImportError:
+        from bytecode_fidelity import compare, compile_source, units
+
+    tree = ast.parse(ast.unparse(ast.fix_missing_locations(tree)))
+    def compiled():
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', SyntaxWarning)
+            return compile_source(ast.unparse(ast.fix_missing_locations(tree)), '<shape-trial>')
+
+    initial = compiled()
+    before = {entry['unit'] for entry in compare(reference, initial, decoder)['entries'] if entry['matched']}
+    references = dict(units(normalize_code(reference)))
+    definitions = defaultdict(list)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            line = node.decorator_list[0].lineno if node.decorator_list else node.lineno
+            definitions[node.name, line].append(node)
+    accepted = []
+    undo = []
+    settled = set(before)
+    for path, code in units(initial):
+        owners = definitions[code.co_name, code.co_firstlineno]
+        if path in settled or path not in references or len(owners) != 1:
+            continue
+        owner = owners[0]
+        original_body = owner.body
+        seen = set()
+        try:
+            for label, body in trials(owner, references[path], code):
+                fingerprint = ast.dump(ast.Module(body=body, type_ignores=[]))
+                if fingerprint in seen:
+                    continue
+                seen.add(fingerprint)
+                owner.body = body
+                try:
+                    candidate = dict(units(compiled())).get(path)
+                    if candidate is not None and compare(references[path], candidate, decoder)['all_units_match']:
+                        undo.append((owner, original_body))
+                        accepted.append({'unit': path, 'shape': label})
+                        settled.update(unit_path for unit_path, _ in units(candidate, path))
+                        break
+                except (SyntaxError, ValueError):
+                    pass
+                finally:
+                    if not accepted or accepted[-1]['unit'] != path:
+                        owner.body = original_body
+        except BaseException:
+            owner.body = original_body
+            for changed, body in reversed(undo):
+                changed.body = body
+            raise
+    if not accepted:
+        return tree, []
+    after = {entry['unit'] for entry in compare(reference, compiled(), decoder)['entries'] if entry['matched']}
+    if not (before | {entry['unit'] for entry in accepted}).issubset(after):
+        for owner, body in reversed(undo):
+            owner.body = body
+        return tree, []
+    return tree, accepted
+
+
+def restore_context_boundaries(tree, reference, decoder):
+    """Close an async context before a swallowed suffix, only by exact proof.
+
+    The original dispatch map decides which work is protected. No operation,
+    predicate, or value is introduced, and genuine transaction bodies remain
+    inside their contexts. Bounded suffix trials also retain undefined-local
+    behavior when a context suppresses failure during setup.
+    """
+    def trials(owner, original, candidate):
+        contexts = [(suite_index, index, len(statement.body))
+                    for suite_index, (_, _, suite) in enumerate(_statement_suites(owner))
+                    for index, statement in enumerate(suite)
+                    if isinstance(statement, ast.AsyncWith) and len(statement.body) > 1]
+        for suite_index, index, length in contexts:
+            for cut in range(max(1, length - 16), length):
+                clone = copy.deepcopy(owner)
+                parent, field, suite = list(_statement_suites(clone))[suite_index]
+                context = suite[index]
+                suffix = context.body[cut:]
+                context.body = context.body[:cut]
+                setattr(parent, field, suite[:index + 1] + suffix + suite[index + 1:])
+                yield f'async-context-suffix-{cut}', clone.body
+    if not any(isinstance(node, ast.AsyncWith) and len(node.body) > 1 for node in ast.walk(tree)):
+        return tree, []
+    return _prove_function_trials(tree, reference, decoder, trials)
+
+
+def preserve_individual_return_edges(tree, reference, decoder):
+    """Prove individual shared returns and legal async-generator exit shapes."""
+    try:
+        from .bytecode_fidelity import canonical
+    except ImportError:
+        from bytecode_fidelity import canonical
+
+    def trials(owner, original, candidate):
+        if candidate.co_flags & 0x200:
+            for callable_values in (False, True):
+                clone = copy.deepcopy(owner)
+                clone.body.append(ast.If(ast.Constant(True), [ast.Return()], []))
+                if callable_values:
+                    instructions = canonical(original, decoder).instructions
+                    needed = {item[1][0] for item, following in zip(instructions, instructions[1:])
+                              if item[0] == 'LOAD_ATTR' and item[1][1] == 0 and following[0] == 'PUSH_NULL'}
+                    changed = False
+                    for node in _function_nodes(clone):
+                        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in needed:
+                            node.func = ast.IfExp(ast.Constant(True), node.func, ast.Constant(None))
+                            changed = True
+                    if not changed:
+                        continue
+                yield 'async-generator-bare-exit' + ('-callable-values' if callable_values else ''), clone.body
+            return
+        returns = [node for node in _function_nodes(owner) if isinstance(node, ast.Return)]
+        for index, _ in enumerate(returns):
+            for depth in range(1, 5):
+                clone = copy.deepcopy(owner)
+                statement = [node for node in _function_nodes(clone) if isinstance(node, ast.Return)][index]
+                statement.value = _fold_value(statement.value, depth)
+                yield f'individual-return-{index}-fold-{depth}', clone.body
+            for depth in (1, 2):
+                clone = copy.deepcopy(owner)
+                _fold_return_statements(clone, depth, index)
+                yield f'individual-statement-return-{index}-fold-{depth}', clone.body
+        for depth in (1, 2):
+            clone = copy.deepcopy(owner)
+            clone.body.append(ast.Return(_fold_value(None, depth)))
+            yield f'shared-implicit-none-{depth}', clone.body
+        # The false-arm form can preserve a shared dict-return edge that the
+        # true-arm form duplicates. Its value and evaluation order are unchanged.
+        for index, statement in enumerate(returns):
+            if not isinstance(statement.value, ast.Dict):
+                continue
+            for implicit in (False, True):
+                clone = copy.deepcopy(owner)
+                returned = [node for node in _function_nodes(clone) if isinstance(node, ast.Return)][index]
+                returned.value = ast.IfExp(ast.Constant(False), ast.Constant(None), returned.value)
+                if implicit:
+                    clone.body.append(ast.Return(_fold_value(None, 1)))
+                yield f'false-arm-dict-return-{index}-implicit-{implicit}', clone.body
+    return _prove_function_trials(tree, reference, decoder, trials)
+
+
+def restore_coupled_statement_shapes(tree, reference, decoder):
+    """Reuse existing statements in bounded structural/return-edge trials.
+
+    Context, handler and value-expression reconstruction can need two source
+    changes together. Neither partial trial is accepted. Shapes below only
+    reuse existing tests/work and implicit None; full unit proof selects the
+    original short circuit, return scope and dispatch, including NaN behavior.
+    """
+    def structural(owner):
+        loop_owned = {id(node) for loop in _function_nodes(owner)
+                      if isinstance(loop, (ast.For, ast.AsyncFor, ast.While))
+                      for node in _function_nodes(loop)}
+        for suite_index, (parent, field, suite) in enumerate(_statement_suites(owner)):
+            for index, statement in enumerate(suite):
+                if (isinstance(statement, ast.Try) and not statement.finalbody
+                        and index + 1 < len(suite)):
+                    # Existing trailing work can be an omitted finally copy.
+                    # Reuse that exact operation, including handler copies;
+                    # the original dispatch map must prove guaranteed cleanup.
+                    cleanup = suite[index + 1]
+                    if isinstance(cleanup, (ast.Assign, ast.Expr)):
+                        clone = copy.deepcopy(owner)
+                        target, target_field, block = list(_statement_suites(clone))[suite_index]
+                        region = block[index]
+                        region.finalbody = [block[index + 1]]
+                        fingerprint = ast.dump(block[index + 1])
+                        for handler in region.handlers:
+                            handler.body = [n for n in handler.body if ast.dump(n) != fingerprint] or [ast.Pass()]
+                        setattr(target, target_field, block[:index + 1] + block[index + 2:])
+                        yield 'existing-trailing-finally', clone
+                    if statement.handlers and not statement.orelse and len(suite) - index - 1 <= 8:
+                        clone = copy.deepcopy(owner)
+                        target, target_field, block = list(_statement_suites(clone))[suite_index]
+                        region = block[index]
+                        region.body = [n for n in region.body if not isinstance(n, ast.Pass)] + block[index + 1:]
+                        setattr(target, target_field, block[:index + 1])
+                        yield 'hoisted-protected-suffix', clone
+                if isinstance(statement, ast.Try) and index + 1 < len(suite) and isinstance(suite[index + 1], ast.Return):
+                    clone = copy.deepcopy(owner)
+                    target, target_field, block = list(_statement_suites(clone))[suite_index]
+                    block[index].body = [n for n in block[index].body if not isinstance(n, ast.Pass)] + [block[index + 1]]
+                    setattr(target, target_field, block[:index + 1] + block[index + 2:])
+                    yield 'one-try-return-scope', clone
+                if isinstance(statement, ast.If) and not statement.orelse:
+                    if len(statement.body) == 1 and isinstance(statement.body[0], ast.If) and not statement.body[0].orelse:
+                        inner = statement.body[0]
+                        if inner.body and (all(isinstance(n, (ast.Return, ast.Raise)) for n in inner.body)
+                                           or (id(statement) in loop_owned and isinstance(inner.body[-1], ast.Continue))):
+                            clone = copy.deepcopy(owner)
+                            branch = list(_statement_suites(clone))[suite_index][2][index]
+                            branch.test = ast.BoolOp(ast.Or(), [ast.UnaryOp(ast.Not(), branch.test), branch.body[0].test])
+                            branch.body = branch.body[0].body
+                            yield 'short-circuit-rejection-return', clone
+                    if id(statement) in loop_owned and not all(isinstance(n, ast.Continue) for n in statement.body):
+                        clone = copy.deepcopy(owner)
+                        target, target_field, block = list(_statement_suites(clone))[suite_index]
+                        branch = block[index]
+                        setattr(target, target_field, block[:index] + [ast.If(ast.UnaryOp(ast.Not(), branch.test), [ast.Continue()], [])]
+                                + branch.body + block[index + 1:])
+                        yield 'loop-rejection-suffix', clone
+                    if index + 1 < len(suite) and isinstance(suite[index + 1], ast.Return):
+                        tail = suite[index + 1]
+                        replacement = None
+                        if len(statement.body) == 1 and isinstance(statement.body[0], ast.Return):
+                            replacement = ast.IfExp(statement.test, statement.body[0].value or ast.Constant(None), tail.value or ast.Constant(None))
+                        elif (len(statement.body) == 1 and isinstance(statement.body[0], ast.Pass)
+                              and isinstance(tail.value, ast.IfExp)):
+                            value = tail.value
+                            replacement = ast.IfExp(ast.BoolOp(ast.And(), [statement.test, value.test]), value.body, value.orelse)
+                        if replacement is not None:
+                            clone = copy.deepcopy(owner)
+                            target, target_field, block = list(_statement_suites(clone))[suite_index]
+                            setattr(target, target_field, block[:index] + [ast.Return(copy.deepcopy(replacement))] + block[index + 2:])
+                            yield 'compound-conditional-return', clone
+                    if (isinstance(parent, ast.Try) and field == 'orelse' and len(suite) == 1
+                            and len(statement.body) == 1 and isinstance(statement.body[0], ast.Return)):
+                        clone = copy.deepcopy(owner)
+                        target, target_field, block = list(_statement_suites(clone))[suite_index]
+                        branch = block[0]
+                        setattr(target, target_field, [ast.Return(ast.IfExp(branch.test, branch.body[0].value or ast.Constant(None), ast.Constant(None)))])
+                        yield 'try-else-conditional-return', clone
+        comprehensions = [node for node in _function_nodes(owner) if isinstance(node, ast.comprehension) and len(node.ifs) > 1]
+        for index in range(len(comprehensions)):
+            clone = copy.deepcopy(owner)
+            node = [n for n in _function_nodes(clone) if isinstance(n, ast.comprehension) and len(n.ifs) > 1][index]
+            node.ifs = [ast.BoolOp(ast.Or(), node.ifs)]
+            yield 'comprehension-or-filter', clone
+        # Merging AND guards can be coupled to a shared implicit return.
+        clone = copy.deepcopy(owner)
+        changed = False
+        for node in _function_nodes(clone):
+            if (isinstance(node, ast.If) and not node.orelse and len(node.body) == 1
+                    and isinstance(node.body[0], ast.If) and not node.body[0].orelse):
+                inner = node.body[0]
+                node.test = ast.BoolOp(ast.And(), [node.test, inner.test])
+                node.body = inner.body
+                changed = True
+        if changed:
+            yield 'nested-and-guards', clone
+
+    def trials(owner, original, candidate):
+        if candidate.co_flags & 0x200:
+            return
+        for label, clone in structural(owner):
+            for depth, implicit in ((0, False), (1, False), (2, False), (3, False),
+                                    (4, False), (0, True), (1, True), (2, True)):
+                trial = copy.deepcopy(clone)
+                if depth:
+                    for node in _function_nodes(trial):
+                        if isinstance(node, ast.Return):
+                            node.value = _fold_value(node.value, depth)
+                if implicit:
+                    trial.body.append(ast.Return(_fold_value(None, 1)))
+                yield f'{label}-fold-{depth}-implicit-{implicit}', trial.body
+            returns = [node for node in _function_nodes(clone) if isinstance(node, ast.Return)]
+            if len(returns) <= 8:
+                for index in range(len(returns)):
+                    for statement_form in (False, True):
+                        trial = copy.deepcopy(clone)
+                        if statement_form:
+                            _fold_return_statements(trial, 1, index)
+                        else:
+                            returned = [node for node in _function_nodes(trial) if isinstance(node, ast.Return)][index]
+                            returned.value = _fold_value(returned.value, 1)
+                        yield f'{label}-single-return-{index}-statement-{statement_form}', trial.body
+            for depth in (1, 2):
+                trial = copy.deepcopy(clone)
+                _fold_return_statements(trial, depth)
+                yield f'{label}-all-statement-return-fold-{depth}', trial.body
+    return _prove_function_trials(tree, reference, decoder, trials)
 
 
 def restore_expanded_keyword_merges(tree, reference, decoder):
@@ -1623,6 +1938,9 @@ def recover(sequence: Path, backend: Path) -> dict:
         tree, report['verified_expanded_keyword_merges'] = restore_expanded_keyword_merges(tree, code, transformer)
         tree, report['verified_chained_comprehension_filters'] = restore_chained_comprehension_filters(tree, code, transformer)
         tree, report['verified_loop_rejection_guards'] = restore_loop_rejection_guards(tree, code, transformer)
+        tree, report['verified_context_boundaries'] = restore_context_boundaries(tree, code, transformer)
+        tree, report['verified_coupled_statement_shapes'] = restore_coupled_statement_shapes(tree, code, transformer)
+        tree, report['verified_individual_return_edges'] = preserve_individual_return_edges(tree, code, transformer)
         source = ast.unparse(tree) + '\n'
         if report['verified_shared_return_shapes']:
             lines = []

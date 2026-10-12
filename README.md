@@ -396,3 +396,29 @@ comprehension iterator slots. The complete corpus retains every previous match
 and gains 97 units with the preceding source repairs. The initial 0.6.14
 blanket-cleanup trial was rejected after five regressions despite passing its
 initial tests. Source verification rules remain unchanged.
+
+### Bounded statement-scope and return-edge trials
+
+Version 0.4.25 adds single-function shape trials selected by full instruction
+and exception-dispatch proof. Failed candidates are rolled back, nested code
+units must match with their owner, and a final whole-module check protects all
+earlier matches. This changes source reconstruction rather than comparison
+rules, signature contracts or exception-coverage tolerances.
+
+The bounded candidates reuse existing statements and expressions to close
+async contexts before swallowed suffixes; restore a return to one protected
+body; retain omitted finally copies; recover OR comprehension filters and
+short-circuit rejection guards; and restore conditional returns in try-else
+suites. Structural repairs are tried together with shared return edges when
+neither change proves alone. Per-site expression and constant-statement return
+forms preserve distinct compiler dispatch boundaries. Async generators use a
+legal constant If with a bare return, optionally together with reference-proved
+callable-value loads; no value-bearing generator return is introduced.
+
+Owned validation passes 167 cases, with one existing legacy expected failure.
+The new cases check context exit order and exception suppression, genuine
+transaction protection, wrong-call/cleanup rejection, predicate evaluation
+order, OR versus AND selection, cancellation cleanup, and async-generator
+normal completion/close/throw. CI pins backend 0.6.16. The independently audited
+application coverage remains recorded by the component's recovery manifests;
+passing these tests alone does not establish a complete recovered application.
