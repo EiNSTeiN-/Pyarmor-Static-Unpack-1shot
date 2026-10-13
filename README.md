@@ -603,3 +603,12 @@ paired behavior cases plus five decorated-owner cases. All 216 unpacker cases
 pass with one existing expected failure. Native 0.6.30 remains pinned, original
 exports and comparator rules are unchanged, and a fresh full-corpus retention
 gate is required before promotion to main.
+
+The .35 gate now passes after fresh source generation for all274 modules,
+without reusing generation across source algorithms. Every previous raw and
+composite match and complete module survives. One new raw/generic owner reaches
+**13,926/14,291 /138 complete raw candidates**; the frozen source overlay reaches
+**14,269/14,291 /259 complete candidates**. All274 sources compile, original
+exports and comparison rules are unchanged, and feature CI passes216 cases
+with the existing expected failure. Version .35 is promoted after this gate;
+later manual source and readability gains are counted separately.
