@@ -133,6 +133,70 @@ class CanonicalCode:
     # established shared-return operation abstraction. This is diagnostic,
     # not an assertion that opcode tracing observes the same physical event.
     return_alias_provenance: tuple = field(default=(), compare=False)
+    terminal_rethrow_provenance: tuple = field(default=(), compare=False)
+
+
+def share_adjacent_rethrows(shape):
+    """Share only adjacent RERAISE0 operations with identical exact dispatch.
+
+    This explicitly permitted compiler-layout variance redirects destinations;
+    it never discards an intervening operation or changes handler priority.
+    Exception regions are rebuilt from retained per-instruction dispatch,
+    avoiding confusion between destinations and half-open range boundaries.
+    """
+    regions = shape.exceptions
+    count = len(shape.instructions)
+    if (shape.unresolved
+            or any(not 0 <= start < end <= count or not 0 <= target < count
+                   for start, end, target, _, _ in regions)
+            or any(left[1] > right[0] for left, right in zip(regions, regions[1:]))):
+        return shape
+
+    handlers = [None] * count
+    for start, end, target, depth, lasti in regions:
+        handlers[start:end] = [(target, depth, lasti)] * (end - start)
+    removed = {index for index in range(1, count)
+               if shape.instructions[index - 1] == shape.instructions[index] == ('RERAISE', 0)
+               and handlers[index - 1] == handlers[index]}
+    if not removed:
+        return shape
+    ordered_removed = sorted(removed)
+
+    def destination(index):
+        while index in removed:
+            index -= 1
+        return index - bisect_left(ordered_removed, index)
+
+    instructions, exceptions = [], []
+    for index, (name, operand) in enumerate(shape.instructions):
+        if index in removed:
+            continue
+        if isinstance(operand, tuple) and operand[:1] == ('target',):
+            operand = ('target', destination(operand[1]))
+        new_index = len(instructions)
+        instructions.append((name, operand))
+        handler = handlers[index]
+        if handler is None:
+            continue
+        target, depth, lasti = handler
+        region = (new_index, new_index + 1, destination(target), depth, lasti)
+        if exceptions and exceptions[-1][1] == new_index and exceptions[-1][2:] == region[2:]:
+            previous = exceptions[-1]
+            exceptions[-1] = (previous[0], new_index + 1, *region[2:])
+        else:
+            exceptions.append(region)
+    aliases = tuple((destination(index), destination(target),
+                     (destination(transfer[0]), *transfer[1:]),
+                     (destination(terminal[0]), *terminal[1:]))
+                    for index, target, transfer, terminal in shape.return_alias_provenance)
+    # First coordinate records the immutable pre-sharing instruction index;
+    # second coordinate and handler target use the resulting canonical view.
+    provenance = tuple((index, destination(index),
+                        (destination(handlers[index][0]), *handlers[index][1:])
+                        if handlers[index] is not None else None)
+                       for index in ordered_removed)
+    return CanonicalCode(shape.signature, tuple(instructions), tuple(exceptions),
+                         shape.unresolved, aliases, provenance)
 
 
 def canonical(code, decoder=None, reserved_local_indices=()):
@@ -393,7 +457,10 @@ def canonical(code, decoder=None, reserved_local_indices=()):
     signature = (code.co_argcount, code.co_posonlyargcount, code.co_kwonlyargcount,
                  code.co_flags, tuple(code.co_varnames[:parameters]),
                  len(code.co_freevars), len(code.co_cellvars) - bool(unused_annotation), docstring)
-    return CanonicalCode(signature, tuple(ops), exceptions, tuple(unresolved), tuple(alias_provenance))
+    shape = CanonicalCode(signature, tuple(ops), exceptions, tuple(unresolved), tuple(alias_provenance))
+    # Physical overlapping rows are ineligible even if a pre-existing alias
+    # abstraction happens to make the projected ranges look disjoint.
+    return share_adjacent_rethrows(shape) if ordered_disjoint else shape
 
 
 def units(code, path='<module>'):
@@ -422,6 +489,11 @@ def compare(reference, candidate, decoder=None):
                 entry['return_alias_provenance'] = {
                     'reference': left.return_alias_provenance,
                     'candidate': right.return_alias_provenance,
+                }
+            if left.terminal_rethrow_provenance or right.terminal_rethrow_provenance:
+                entry['terminal_rethrow_provenance'] = {
+                    'reference': left.terminal_rethrow_provenance,
+                    'candidate': right.terminal_rethrow_provenance,
                 }
             if left.unresolved or right.unresolved:
                 entry.update(reason='unsupported_marker_pattern', unresolved_marker_count=len(left.unresolved) + len(right.unresolved))

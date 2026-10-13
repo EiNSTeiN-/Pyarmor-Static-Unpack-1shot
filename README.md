@@ -696,3 +696,23 @@ The source-generation algorithm remains byte-identical to .36; native .30 is
 unchanged. The separate WeatherExpert duplicated-rethrow mismatch remains
 strictly rejected. No blanket exception relaxation or terminal-deduplication
 rule is introduced.
+
+Version 0.4.39 adds an explicitly approved compiler-layout variance: adjacent
+`RERAISE 0` copies may share one terminal only when their exact handler target,
+depth, and lasti dispatch agree. All incoming branch and handler targets are
+relocated. Exception regions are rebuilt from retained per-instruction dispatch,
+so split half-open boundaries keep their coverage. Original deleted positions
+and relocated handlers remain in diagnostic provenance. Overlapping or
+out-of-order physical tables are ineligible. Operand changes, intervening work,
+coverage holes and different handlers remain significant.
+
+Six additional owned regressions cover literal source layouts, split-boundary
+relocation, either terminal's handler/operand mutations, overlapping priority,
+unresolved markers, longer runs and previous return-alias diagnostics. All 239
+unpacker cases run with the native backend: 238 pass and one existing expected
+failure. The full unchanged corpus proves **14,291/14,291 units and all 274
+complete candidates**, with one composite gain and zero losses from .38. Raw
+generation retains 13,930 matches and 138 complete modules; the source generator
+and native backend are unchanged. This is normalized instruction/dispatch
+equivalence under the documented whitelist, not raw byte-for-byte identity or
+whole-application runtime testing.
