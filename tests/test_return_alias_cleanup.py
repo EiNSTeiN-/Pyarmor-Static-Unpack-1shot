@@ -23,13 +23,15 @@ class ReturnAliasCleanupTests(unittest.TestCase):
 '''
 
     @staticmethod
-    def table(rows):
+    def table(rows, *, preserve_order=False):
+        if not preserve_order:
+            rows = sorted(rows, key=lambda row: (row.start, row.end, row.target))
         return b''.join(
             _varint(row.start // 2, True)
             + _varint((row.end - row.start) // 2)
             + _varint(row.target // 2)
             + _varint((row.depth << 1) | row.lasti)
-            for row in sorted(rows, key=lambda row: (row.start, row.end, row.target)))
+            for row in rows)
 
     @staticmethod
     def without(rows, offset):
@@ -113,6 +115,49 @@ class ReturnAliasCleanupTests(unittest.TestCase):
         self.assertFalse(compare(alias, uncovered)['all_units_match'])
         synchronous = alias.replace(co_flags=alias.co_flags & ~128)
         self.assertEqual(canonical(synchronous).return_alias_provenance, ())
+
+    def test_overlapping_routes_elsewhere_keep_their_priority_and_fail_comparison(self):
+        _, alias, first, _, intrinsic, _, rows = self.fixture()
+        rows = sorted(rows, key=lambda row: (row.start, row.end, row.target))
+        original = next(row for row in rows
+                        if row.depth == 0 and not row.lasti and row.end <= first)
+        other = original._replace(target=intrinsic, lasti=True)
+        index = rows.index(original)
+        first_order = rows[:index] + [original, other] + rows[index + 1:]
+        second_order = rows[:index] + [other, original] + rows[index + 1:]
+        left = alias.replace(co_exceptiontable=self.table(first_order, preserve_order=True))
+        right = alias.replace(co_exceptiontable=self.table(second_order, preserve_order=True))
+        self.assertEqual(canonical(left).return_alias_provenance, ())
+        self.assertEqual(canonical(right).return_alias_provenance, ())
+        self.assertNotEqual(canonical(left).exceptions, canonical(right).exceptions)
+        self.assertFalse(compare(left, right)['all_units_match'])
+        self.assertFalse(compare(right, left)['all_units_match'])
+
+    def test_ambiguous_deep_backward_and_chained_transfers_do_not_qualify(self):
+        _, alias, first, target, _, _, rows = self.fixture()
+        for offset in (first, target):
+            with self.subTest(ambiguous_offset=offset):
+                duplicated = next(row for row in rows if row.start <= offset < row.end)
+                changed = alias.replace(co_exceptiontable=self.table(rows + [duplicated]))
+                self.assertEqual(canonical(changed).return_alias_provenance, ())
+        deep = alias.replace(co_exceptiontable=self.table([
+            row._replace(depth=1) if row.start <= first < row.end else row for row in rows]))
+        self.assertEqual(canonical(deep).return_alias_provenance, ())
+        operations = bytearray(alias.co_code)
+        operations[first:first + 2] = bytes((dis.opmap['RETURN_VALUE'], 0))
+        operations[target:target + 2] = bytes((dis.opmap['JUMP_BACKWARD'], (target + 2 - first) // 2))
+        backward_rows = self.without(rows, target)
+        user = next(row for row in rows if row.start <= first < row.end)
+        backward_rows.append(user._replace(start=target, end=target + 2))
+        backward = alias.replace(co_code=bytes(operations), co_exceptiontable=self.table(backward_rows))
+        self.assertEqual(canonical(backward).return_alias_provenance, ())
+        final_return = next(op.offset for op in dis.get_instructions(alias)
+                            if op.opname == 'RETURN_VALUE' and op.offset > target)
+        operations = bytearray(alias.co_code)
+        operations[target:target + 2] = bytes((dis.opmap['JUMP_FORWARD'],
+                                               (final_return - target - 2) // 2))
+        chained = alias.replace(co_code=bytes(operations))
+        self.assertEqual(canonical(chained).return_alias_provenance, ())
 
 
 if __name__ == '__main__':

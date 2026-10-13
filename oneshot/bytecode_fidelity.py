@@ -325,7 +325,14 @@ def canonical(code, decoder=None, reserved_local_indices=()):
     entries = tuple(dis.Bytecode(code).exception_entries)
     projected_routes, alias_provenance = [], []
     physical = {item.offset: item for item in original}
-    if code.co_flags & 128:  # Only native coroutine return cleanup is proved.
+    # Insertion/merging is safe only for an ordered, disjoint table. Preserve
+    # legacy row priority on ambiguous coverage anywhere in the code object,
+    # including intervals away from the alias and its terminal.
+    ordered_disjoint = (all(row.start < row.end for row in entries)
+                        and all(left.end <= right.start
+                                for left, right in zip(entries, entries[1:])))
+    if code.co_flags & 128 and ordered_disjoint:
+        # Only native coroutine return cleanup is proved.
         for index, target in sorted(alias_targets.items()):
             transfer_op = physical[offsets[index]]
             terminal_op = physical[offsets[target]]

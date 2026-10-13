@@ -685,8 +685,10 @@ handlers/depth/lasti, noncoroutines, and intervening work do not qualify.
 Original transfer and terminal provenance is retained in diagnostics. This
 does not assert equivalence of physical opcode-tracing events.
 
-Six owned regressions test the correction and its negatives. All 231 unpacker
-cases run with the native backend: 230 pass and one existing expected failure.
+Eight owned regressions test the correction and its negatives. Projection also
+requires a globally ordered, disjoint exception table, preserving overlapping
+handler priority even away from the alias. All 233 unpacker cases run with the
+native backend: 232 pass and one existing expected failure.
 The complete unchanged 274-payload corpus retains every prior match: raw
 13,930/14,291 (one gain, zero losses) and readable composite 14,290/14,291
 (17 gains, zero losses), with 273 complete candidates. All 274 sources compile.
