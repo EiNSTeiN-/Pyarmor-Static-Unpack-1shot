@@ -563,8 +563,20 @@ protocol during split protected walks; it addresses the prior full-corpus
 retention failure rather than relaxing any comparison rule. Native checks
 pass 35 Rust tests and 72 behavior methods, including 486 new paired return
 cases. A new public reader regression proves complete instructions and
-exception tables for two ordinary nested-query fixtures, then compares 432
+exception tables for two ordinary nested-query fixtures, then compares 216
 paired return, cleanup, row-error, suppression and cancellation scenarios.
 The unpacker suite passes all 211 cases with one existing expected failure.
 The new full raw/composite corpus gate is pending; stable main remains
 0.4.31/native0.6.25 until it passes without prior-match losses.
+
+Version 0.4.34 development pins native 0.6.30 and extends the public reader
+regression with a conditional early return, a typed parsing handler and a
+second query. The .29 corpus failure is preserved: fifteen raw gains and one
+lost reader match. The native correction retains a displaced exit still
+protected by a known context handler even after the lexical blocks disappear.
+The source API and comparator remain unchanged from .31. Three complete
+ordinary reader trees prove exact instructions and exception tables; 396
+paired scenarios check query/context lifetime, parsing/building, failures,
+cancellation and suppression. All 211 unpacker cases pass with one existing
+expected failure. The corrected original reader again proves all 68 units.
+Stable promotion still requires the new complete frozen corpus retention gate.

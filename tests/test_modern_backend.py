@@ -56,6 +56,27 @@ class ModernBackendTests(native.Python314Tests):
         owner.record(error)
         return []
 ''',
+            '''async def work(owner):
+    try:
+        async with owner:
+            async with owner.query("row0") as query:
+                first = await query.read()
+            if not first:
+                return
+            parsed = None
+            if first[0]:
+                try:
+                    parsed = owner.parse(first[0])
+                except ValueError:
+                    pass
+            async with owner.query("row1") as query:
+                second = (await query.read())[0]
+            loaded = second > 0
+            return owner.build(first, loaded, parsed)
+    except Exception as error:
+        owner.record(error)
+        return
+''',
         )
         for source in sources:
             code = compile_source(source, 'owned-protected-reader')
@@ -80,7 +101,7 @@ class ModernBackendTests(native.Python314Tests):
             exec(compile_source(candidate, 'owned-reader-candidate'), reconstructed)
             for rows in ([], [1, 2], [0, 'bad', 3], ['cancel', 4]):
                 for fault in ('', 'outer-enter', 'query-enter', 'read', 'read-cancel',
-                              'query-exit', 'outer-exit', 'build', 'build-cancel'):
+                              'query-exit', 'outer-exit', 'build', 'build-cancel', 'parse', 'parse-cancel'):
                     for suppression in ('', 'outer', 'query'):
                         def exercise(function):
                             events = []
@@ -111,10 +132,14 @@ class ModernBackendTests(native.Python314Tests):
                                     return suppression == 'outer'
                                 def query(self, name):
                                     events.append(('query', name)); return Query(self, name)
-                                def build(self, value, other=None):
-                                    events.append(('build', self.active, value, other)); fail('build')
+                                def parse(self, value):
+                                    events.append(('parse', self.active, value)); fail('parse')
+                                    return int(value)
+                                def build(self, value, other=None, parsed=None):
+                                    events.append(('build', self.active, value, other, parsed)); fail('build')
                                     if value == 'bad': raise LookupError('owned row')
                                     if value == 'cancel': raise asyncio.CancelledError('owned row')
+                                    if isinstance(other, bool): return value, other, parsed
                                     return value + other if other is not None else value * 2
                                 def record(self, error): events.append(('record', type(error).__name__, str(error)))
                             owner = Owner()
