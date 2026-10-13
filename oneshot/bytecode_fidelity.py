@@ -11,7 +11,7 @@ import argparse
 import ast
 from bisect import bisect_left
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import dis
 import hashlib
 import importlib.util
@@ -129,6 +129,10 @@ class CanonicalCode:
     instructions: tuple
     exceptions: tuple
     unresolved: tuple
+    # Record erased transfer-site provenance separately from the already
+    # established shared-return operation abstraction. This is diagnostic,
+    # not an assertion that opcode tracing observes the same physical event.
+    return_alias_provenance: tuple = field(default=(), compare=False)
 
 
 def canonical(code, decoder=None, reserved_local_indices=()):
@@ -304,10 +308,12 @@ def canonical(code, decoder=None, reserved_local_indices=()):
     # Complete the existing shared-return alias rule before comparing handler
     # ranges. A forward jump directly to a bare RETURN_VALUE contains no user
     # operation or backward-jump interrupt check. Its own non-lasti dispatch
-    # slot is return plumbing, not a protected evaluation. Keep every other
-    # instruction's handler, depth and lasti significant, including real
-    # RETURN_VALUE slots and all generator/exception cleanup coverage.
+    # slot is transfer plumbing, not the effective RETURN operation. Keep
+    # every real RETURN slot and all lasti-covered alias routes significant.
+    # If the target is an intrinsic-covered coroutine return, the substituted
+    # operation must carry that target's route rather than a fabricated hole.
     return_aliases = set()
+    alias_targets = {}
     for index, (name, operand) in enumerate(ops):
         if name == 'JUMP' and operand[0] == 'target':
             target = operand[1]
@@ -315,8 +321,33 @@ def canonical(code, decoder=None, reserved_local_indices=()):
                 ops[index] = ('RETURN_VALUE', None)
                 if index < target:
                     return_aliases.add(index)
+                    alias_targets[index] = target
+    entries = tuple(dis.Bytecode(code).exception_entries)
+    projected_routes, alias_provenance = [], []
+    physical = {item.offset: item for item in original}
+    if code.co_flags & 128:  # Only native coroutine return cleanup is proved.
+        for index, target in sorted(alias_targets.items()):
+            transfer_op = physical[offsets[index]]
+            terminal_op = physical[offsets[target]]
+            if transfer_op.opname != 'JUMP_FORWARD' or terminal_op.opname != 'RETURN_VALUE':
+                continue
+            transfer = [row for row in entries if row.start <= offsets[index] < row.end]
+            terminal = [row for row in entries if row.start <= offsets[target] < row.end]
+            if len(transfer) != 1 or len(terminal) != 1:
+                continue
+            source_route, target_route = transfer[0], terminal[0]
+            if source_route.lasti or source_route.depth != 0:
+                continue
+            handler = position(target_route.target)
+            if (target_route.depth != 0 or not target_route.lasti
+                    or handler >= len(ops) or ops[handler] != ('CALL_INTRINSIC_1', 3)):
+                continue
+            projected_routes.append((index, index + 1, handler, 0, True))
+            alias_provenance.append((index, target,
+                                     (position(source_route.target), source_route.depth, source_route.lasti),
+                                     (handler, target_route.depth, target_route.lasti)))
     exceptions = []
-    for entry in dis.Bytecode(code).exception_entries:
+    for entry in entries:
         region = (position(entry.start), position(entry.end), position(entry.target), entry.depth, entry.lasti)
         segments = []
         start = region[0]
@@ -337,6 +368,17 @@ def canonical(code, decoder=None, reserved_local_indices=()):
                 exceptions[-1] = (previous[0], region[1], *region[2:])
             else:
                 exceptions.append(region)
+    if projected_routes:
+        # Every eligible alias had one removed non-lasti transfer route, so
+        # adding its effective return route cannot overlap another region.
+        merged = []
+        for region in sorted(exceptions + projected_routes):
+            if merged and merged[-1][1] == region[0] and merged[-1][2:] == region[2:]:
+                previous = merged[-1]
+                merged[-1] = (previous[0], region[1], *region[2:])
+            else:
+                merged.append(region)
+        exceptions = merged
     exceptions = tuple(exceptions)
     parameters = code.co_argcount + code.co_kwonlyargcount
     parameters += bool(code.co_flags & 4) + bool(code.co_flags & 8)
@@ -344,7 +386,7 @@ def canonical(code, decoder=None, reserved_local_indices=()):
     signature = (code.co_argcount, code.co_posonlyargcount, code.co_kwonlyargcount,
                  code.co_flags, tuple(code.co_varnames[:parameters]),
                  len(code.co_freevars), len(code.co_cellvars) - bool(unused_annotation), docstring)
-    return CanonicalCode(signature, tuple(ops), exceptions, tuple(unresolved))
+    return CanonicalCode(signature, tuple(ops), exceptions, tuple(unresolved), tuple(alias_provenance))
 
 
 def units(code, path='<module>'):
@@ -369,6 +411,11 @@ def compare(reference, candidate, decoder=None):
             reserved = unused_protection_slot_aliases(expected[path], actual[path])
             left = canonical(expected[path], decoder)
             right = canonical(actual[path], decoder, reserved)
+            if left.return_alias_provenance or right.return_alias_provenance:
+                entry['return_alias_provenance'] = {
+                    'reference': left.return_alias_provenance,
+                    'candidate': right.return_alias_provenance,
+                }
             if left.unresolved or right.unresolved:
                 entry.update(reason='unsupported_marker_pattern', unresolved_marker_count=len(left.unresolved) + len(right.unresolved))
             elif left.signature != right.signature:

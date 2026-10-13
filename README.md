@@ -669,3 +669,28 @@ all 1,265 affected units and the complete corpus still prove the same
 instructions and exception regions. All 274 candidates compile. Feature CI
 passes 225 cases with the existing expected failure. Version .37 is promoted
 after these gates; no instruction or exception-table variance is added.
+
+Version 0.4.38 repairs the effective dispatch of an already-normalized shared
+coroutine return. The old alias rule replaced a user-covered forward jump with
+a canonical return but left an artificial handler hole. It could consequently
+accept a direct actual return whose intrinsic cleanup interval was missing,
+while rejecting the correctly guarded direct return.
+
+The repair applies only when a native coroutine has a forward jump directly
+to a bare return, one depth-zero non-lasti transfer route, and one depth-zero
+lasti target route to `INTRINSIC_STOPITERATION_ERROR`. The projected operation
+receives that exact target route. Physical return coverage and lasti-covered
+aliases stay significant; uncovered or ambiguous transfers, changed target
+handlers/depth/lasti, noncoroutines, and intervening work do not qualify.
+Original transfer and terminal provenance is retained in diagnostics. This
+does not assert equivalence of physical opcode-tracing events.
+
+Six owned regressions test the correction and its negatives. All 231 unpacker
+cases run with the native backend: 230 pass and one existing expected failure.
+The complete unchanged 274-payload corpus retains every prior match: raw
+13,930/14,291 (one gain, zero losses) and readable composite 14,290/14,291
+(17 gains, zero losses), with 273 complete candidates. All 274 sources compile.
+The source-generation algorithm remains byte-identical to .36; native .30 is
+unchanged. The separate WeatherExpert duplicated-rethrow mismatch remains
+strictly rejected. No blanket exception relaxation or terminal-deduplication
+rule is introduced.
