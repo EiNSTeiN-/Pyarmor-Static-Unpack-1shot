@@ -527,3 +527,20 @@ remain untouched. Five owned methods and one full export-pipeline method test
 the boundary, ordinary behavior, retained docstrings/children and rejection of
 changed work, handlers or invented locals. The application corpus gate remains
 required before promotion. The workflow pins proved native 0.6.24.
+
+Version 0.4.31 development proves context results displaced into a four-argument
+`await None(result, None, None, None)` alias. Only an existing protected async
+context with an identical trailing handler qualifies for bounded trials.
+The result expression and at most three intervening statements return to that
+context; no business expression is invented. Handler-owned loop continuation
+and shared implicit-None compiler shapes are separate trials. Exact original
+owner/descendant instructions and exception tables, followed by full module
+retention, decide every acceptance. Genuine independent calls, nonprotocol
+arguments, different handlers, wrong results and extra work remain unchanged.
+
+Four owned methods cover 72 paired normal, malformed row, context suppression,
+construction/exit faults and cancellation cases, plus strict negative controls,
+docstrings and generator descendants. The source and compiler version are
+0.4.31; the workflow pins tested native 0.6.25. Both full corpus gates remain
+required before this development version is promoted. Comparator rules and
+original input exports are unchanged.

@@ -1617,6 +1617,75 @@ def restore_physical_local_slots(tree, reference, decoder):
     return _prove_function_trials(tree, reference, decoder, trials)
 
 
+def restore_displaced_context_results(tree, reference, decoder):
+    """Prove values displaced into a bogus async-exit call after a context.
+
+    The four-argument None call supplies an existing result and protocol
+    placeholders. Its duplicate handler is a candidate continuation, never
+    proof of shared scope. Reuse only that result and the short existing suffix;
+    complete owner/descendant and module retention decide every accepted edit.
+    """
+    def continuations(owner):
+        sites = [(suite_index, index)
+                 for suite_index, (parent, field, suite) in enumerate(_statement_suites(owner))
+                 if isinstance(parent, (ast.For, ast.AsyncFor, ast.While)) and field == 'body'
+                 for index, region in enumerate(suite[:-1])
+                 if isinstance(region, ast.Try) and region.handlers
+                 and not region.orelse and not region.finalbody
+                 and isinstance(suite[index + 1], ast.Continue)]
+        yield 'existing-loop-continuations', owner
+        for suite_index, index in sites[:4]:
+            clone = copy.deepcopy(owner)
+            parent, field, block = list(_statement_suites(clone))[suite_index]
+            region, continuation = block[index:index + 2]
+            for handler in region.handlers:
+                handler.body.append(copy.deepcopy(continuation))
+            setattr(parent, field, block[:index + 1] + block[index + 2:])
+            yield f'handler-owned-continue-{suite_index}-{index}', clone
+
+    def trials(owner, original, candidate):
+        for suite_index, (_, _, suite) in enumerate(_statement_suites(owner)):
+            for index, region in enumerate(suite[:-1]):
+                if (not isinstance(region, ast.Try) or not region.handlers
+                        or region.orelse or region.finalbody or len(region.body) != 1
+                        or not isinstance(region.body[0], ast.AsyncWith)):
+                    continue
+                handlers = ast.dump(ast.Module(body=region.handlers, type_ignores=[]))
+                for stop in range(index + 1, min(len(suite), index + 5)):
+                    alias = suite[stop]
+                    if (not isinstance(alias, ast.Try) or alias.orelse or alias.finalbody
+                            or len(alias.body) != 1 or not isinstance(alias.body[0], ast.Expr)
+                            or not isinstance(alias.body[0].value, ast.Await)
+                            or ast.dump(ast.Module(body=alias.handlers, type_ignores=[])) != handlers):
+                        continue
+                    call = alias.body[0].value.value
+                    if (not isinstance(call, ast.Call) or call.keywords or len(call.args) != 4
+                            or not isinstance(call.func, ast.Constant) or call.func.value is not None
+                            or not all(isinstance(arg, ast.Constant) and arg.value is None
+                                       for arg in call.args[1:])):
+                        continue
+                    clone = copy.deepcopy(owner)
+                    parent, field, block = list(_statement_suites(clone))[suite_index]
+                    context = block[index].body[0]
+                    context.body.extend(block[index + 1:stop])
+                    context.body.append(ast.Return(copy.deepcopy(call.args[0])))
+                    setattr(parent, field, block[:index + 1] + block[stop + 1:])
+                    for label, variant in continuations(clone):
+                        yield 'context-result-' + label, variant.body
+                        # Context suppression can reach the original shared
+                        # implicit-None edge. Try distinct compiler shapes;
+                        # none is assumed equivalent without complete proof.
+                        for depth in (1, 2):
+                            returned = copy.deepcopy(variant)
+                            returned.body.append(ast.Return(_fold_value(None, depth)))
+                            yield f'context-result-{label}-value-tail-{depth}', returned.body
+                        returned = copy.deepcopy(variant)
+                        returned.body.append(ast.If(ast.Constant(True), [ast.Return()], []))
+                        yield 'context-result-' + label + '-statement-tail', returned.body
+
+    return _prove_function_trials(tree, reference, decoder, trials)
+
+
 def restore_substantive_value_shapes(tree, reference, decoder):
     """Recover existing operands and bindings only with full subtree proof.
 
@@ -2568,6 +2637,7 @@ def recover(sequence: Path, backend: Path) -> dict:
         tree, report['verified_shared_guard_shapes'] = restore_shared_guard_shapes(tree, code, transformer)
         tree, report['verified_payload_and_handler_shapes'] = restore_payload_and_handler_shapes(tree, code, transformer)
         tree, report['verified_physical_local_slots'] = restore_physical_local_slots(tree, code, transformer)
+        tree, report['verified_displaced_context_results'] = restore_displaced_context_results(tree, code, transformer)
         source = ast.unparse(tree) + '\n'
         if report['verified_shared_return_shapes']:
             lines = []
