@@ -23,6 +23,107 @@ BACKEND = os.environ.get('PYARMOR_MODERN_BACKEND')
 @unittest.skipUnless(BACKEND and sys.version_info[:2] == (3, 14),
                      'Set PYARMOR_MODERN_BACKEND and use CPython 3.14')
 class ModernBackendTests(native.Python314Tests):
+    def test_protected_reader_return_survives_nested_normal_exit(self):
+        import asyncio
+        from bytecode_fidelity import compare, compile_source
+        sources = (
+            '''async def work(owner):
+    try:
+        async with owner:
+            async with owner.query("row0") as query:
+                rows = await query.read()
+            values = []
+            for row in rows:
+                try:
+                    values.append(owner.build(row))
+                except Exception as error:
+                    owner.record(error)
+                    continue
+            return values
+    except Exception as error:
+        owner.record(error)
+        return []
+''',
+            '''async def work(owner):
+    try:
+        async with owner:
+            async with owner.query("row0") as query:
+                first = await query.read()
+            async with owner.query("row1") as query:
+                second = await query.read()
+            return owner.build(first, second)
+    except Exception as error:
+        owner.record(error)
+        return []
+''',
+        )
+        for source in sources:
+            code = compile_source(source, 'owned-protected-reader')
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'fixture.pyc'
+                path.write_bytes(importlib.util.MAGIC_NUMBER + bytes(12) + marshal.dumps(code))
+                process = subprocess.run([str(BINARY), '--pyc', '--export-only', str(path)],
+                                         capture_output=True, text=True, timeout=10)
+                self.assertEqual(process.returncode, 0, process.stderr)
+                prefix = Path(directory) / 'fixture.1shot'
+                Path(str(path) + '.recovered.pyc').rename(Path(str(prefix) + '.recovered.pyc'))
+                sequence = Path(str(prefix) + '.seq')
+                sequence.write_bytes(b'\xa1' + bytes(16) + b'\xa2' + bytes(12) + b'\xf0\xff\x00\x00')
+                report = recover(sequence, Path(BACKEND).resolve())
+                self.assertTrue(report['syntax_valid'])
+                candidate = Path(str(prefix) + '.cdc.py').read_text()
+            # A native structural warning can precede a fully proved source
+            # postpass. Accept only the complete instruction/exception proof.
+            self.assertTrue(compare(code, compile_source(candidate, 'owned-reader-candidate'))['all_units_match'])
+            original, reconstructed = {}, {}
+            exec(code, original)
+            exec(compile_source(candidate, 'owned-reader-candidate'), reconstructed)
+            for rows in ([], [1, 2], [0, 'bad', 3], ['cancel', 4]):
+                for fault in ('', 'outer-enter', 'query-enter', 'read', 'read-cancel',
+                              'query-exit', 'outer-exit', 'build', 'build-cancel'):
+                    for suppression in ('', 'outer', 'query'):
+                        def exercise(function):
+                            events = []
+                            def fail(stage):
+                                if fault == stage:
+                                    raise ValueError('owned ' + stage)
+                                if fault == stage + '-cancel':
+                                    raise asyncio.CancelledError('owned ' + stage)
+                            class Query:
+                                def __init__(self, owner, name): self.owner, self.name = owner, name
+                                async def __aenter__(self):
+                                    events.append(('query-enter', self.name)); fail('query-enter')
+                                    return self
+                                async def read(self):
+                                    events.append(('read', self.name)); fail('read')
+                                    return list(rows)
+                                async def __aexit__(self, kind, error, traceback):
+                                    events.append(('query-exit', self.name, kind.__name__ if kind else None))
+                                    fail('query-exit'); return suppression == 'query'
+                            class Owner:
+                                active = False
+                                async def __aenter__(self):
+                                    events.append('outer-enter'); fail('outer-enter')
+                                    self.active = True; return self
+                                async def __aexit__(self, kind, error, traceback):
+                                    events.append(('outer-exit', kind.__name__ if kind else None))
+                                    self.active = False; fail('outer-exit')
+                                    return suppression == 'outer'
+                                def query(self, name):
+                                    events.append(('query', name)); return Query(self, name)
+                                def build(self, value, other=None):
+                                    events.append(('build', self.active, value, other)); fail('build')
+                                    if value == 'bad': raise LookupError('owned row')
+                                    if value == 'cancel': raise asyncio.CancelledError('owned row')
+                                    return value + other if other is not None else value * 2
+                                def record(self, error): events.append(('record', type(error).__name__, str(error)))
+                            owner = Owner()
+                            try: result = ('return', asyncio.run(function(owner)))
+                            except BaseException as error: result = ('raise', type(error).__name__, str(error))
+                            return result, events, owner.active
+                        with self.subTest(rows=rows, fault=fault, suppression=suppression):
+                            self.assertEqual(exercise(original['work']), exercise(reconstructed['work']))
+
     def test_original_dead_marker_slot_survives_full_export_pipeline(self):
         from bytecode_fidelity import compare, compile_source
         source = ('def work(rows):\n'

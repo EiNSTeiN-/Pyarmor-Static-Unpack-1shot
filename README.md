@@ -555,3 +555,16 @@ the unpacker suite passes 210 cases with one existing expected failure.
 Full frozen raw/composite corpus retention is required before promotion;
 investigator source recipes are separately proved and cannot be counted as
 native or generic source-postpass gains.
+
+Version 0.4.33 development pins native 0.6.29. Source postpasses and the
+comparator are byte-for-byte unchanged from 0.4.31. The native refinement
+preserves padded constant/calculated Returns and the existing nested exit
+protocol during split protected walks; it addresses the prior full-corpus
+retention failure rather than relaxing any comparison rule. Native checks
+pass 35 Rust tests and 72 behavior methods, including 486 new paired return
+cases. A new public reader regression proves complete instructions and
+exception tables for two ordinary nested-query fixtures, then compares 432
+paired return, cleanup, row-error, suppression and cancellation scenarios.
+The unpacker suite passes all 211 cases with one existing expected failure.
+The new full raw/composite corpus gate is pending; stable main remains
+0.4.31/native0.6.25 until it passes without prior-match losses.
