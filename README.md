@@ -658,3 +658,14 @@ unchanged from .36. A frozen full raw/composite retention gate is required
 before promotion; generation can be reused because no generation algorithm
 changed. The seventeen coroutine exception gaps and terminal rethrow mismatch
 remain strict failures.
+
+The comparison-only .37 gate passes for all 274 unchanged exports, reusing
+the byte-identical .36 source-generation algorithm. Raw coverage retains
+13,929/14,291 units and 138 complete modules; the frozen 176-module readable
+overlay retains 14,273/14,291 and 263 complete candidates. Every previous unit
+path and complete module survives, with zero gains or losses. A second frozen
+overlay renames ten unused reservation slots in nine complete readable files;
+all 1,265 affected units and the complete corpus still prove the same
+instructions and exception regions. All 274 candidates compile. Feature CI
+passes 225 cases with the existing expected failure. Version .37 is promoted
+after these gates; no instruction or exception-table variance is added.
