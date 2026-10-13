@@ -544,3 +544,14 @@ docstrings and generator descendants. The source and compiler version are
 0.4.31; the workflow pins tested native 0.6.25. Both full corpus gates remain
 required before this development version is promoted. Comparator rules and
 original input exports are unchanged.
+
+Version 0.4.32 development pins native 0.6.28. Source postpasses and the
+bytecode comparator remain unchanged from 0.4.31. Native repairs preserve
+typed clauses reached past a private handler body, recognize complete normal
+async-context exit suspension spans, and keep For-handler breaks after the
+compiler's iterator discard. Ordinary user awaits and unrelated discards
+remain visible. Native checks pass 35 Rust tests and 69 behavior methods;
+the unpacker suite passes 210 cases with one existing expected failure.
+Full frozen raw/composite corpus retention is required before promotion;
+investigator source recipes are separately proved and cannot be counted as
+native or generic source-postpass gains.
