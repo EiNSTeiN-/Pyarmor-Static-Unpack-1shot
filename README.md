@@ -612,3 +612,21 @@ composite match and complete module survives. One new raw/generic owner reaches
 exports and comparison rules are unchanged, and feature CI passes216 cases
 with the existing expected failure. Version .35 is promoted after this gate;
 later manual source and readability gains are counted separately.
+
+Version 0.4.36 development adds one directed asymmetric return join. For a
+For-only conditional return, the normal unwind has three meaningful operations;
+the multiline return adds only one location NOP, still within CPython's copy
+limit. Folding the existing false arm once and the whole expression twice,
+together with multiline rendering, preserves the shared cleanup topology.
+Previously introduced constant folds are peeled only for that trial. No user
+predicate, call, value, handler, or dependency is invented or discarded.
+
+Every trial still requires the complete owner/descendant instruction and
+exception proof plus module retention. Three new owned regressions compare
+56 paired ordinary/error paths, check idempotency and complete source-pipeline
+recovery, and reject changed conversion, false result and branch conditions.
+All219 suite cases pass with one existing expected failure. Three protected
+raw owner trees independently gain one match each without losses: both JSON
+count readers and the timestamp adapter. Their other incomplete raw neighbors
+remain unclaimed. Native0.6.30 and comparator rules stay unchanged; full-corpus
+retention remains required before .36 promotion.

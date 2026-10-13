@@ -2631,12 +2631,29 @@ def _format_multiline_return_shapes(source, reference, decoder):
 
     def render(edits):
         lines = source.splitlines()
-        for line_number, (statement, depth) in sorted(edits.items(), reverse=True):
+        for line_number, (statement, depth, asymmetric) in sorted(edits.items(), reverse=True):
             line = lines[line_number - 1]
             indent = line[:len(line) - len(line.lstrip())]
             if line.lstrip()[:7] != 'return ':
                 raise ValueError('Return statement must own its complete source line')
             expression = ast.get_source_segment(source, statement.value)
+            if asymmetric:
+                def without_existing_folds(value):
+                    for _ in range(4):
+                        if (isinstance(value, ast.IfExp)
+                                and isinstance(value.test, ast.Constant) and value.test.value is True
+                                and isinstance(value.orelse, ast.Constant) and value.orelse.value is None):
+                            value = value.body
+                        else:
+                            break
+                    return value
+
+                value = without_existing_folds(copy.deepcopy(statement.value))
+                if not isinstance(value, ast.IfExp):
+                    raise ValueError('Asymmetric rendering requires an existing conditional expression')
+                value.body = without_existing_folds(value.body)
+                value.orelse = _fold_value(without_existing_folds(value.orelse), 1)
+                expression = ast.unparse(value)
             for _ in range(depth):
                 expression = '(' + expression + ') if True else None'
             lines[line_number - 1:line_number] = [
@@ -2656,7 +2673,7 @@ def _format_multiline_return_shapes(source, reference, decoder):
         for depth in range(4):
             for group in groups:
                 edits = dict(accepted)
-                edits.update({statement.lineno: (statement, depth) for statement in group})
+                edits.update({statement.lineno: (statement, depth, False) for statement in group})
                 try:
                     trial_source = render(edits)
                     trial_codes, after = checked(trial_source)
@@ -2670,6 +2687,26 @@ def _format_multiline_return_shapes(source, reference, decoder):
                     break
             if found:
                 break
+        if not found:
+            # A For-only unwind has three meaningful instructions. The
+            # return-location NOP alone still leaves it within CPython's
+            # four-instruction copy limit. A proved join in the existing
+            # conditional's false arm, coupled with two outer folds and the
+            # multiline return, retains the shared cleanup block instead.
+            # Try this one directed shape, not an arbitrary arm-fold matrix.
+            for group in groups:
+                edits = dict(accepted)
+                edits.update({statement.lineno: (statement, 2, True) for statement in group})
+                try:
+                    trial_source = render(edits)
+                    trial_codes, after = checked(trial_source)
+                    proof = compare(references[path], trial_codes[path], decoder)
+                except (SyntaxError, ValueError, KeyError):
+                    continue
+                if proof['all_units_match'] and (before | set(selected)).issubset(after):
+                    accepted = edits
+                    selected.append(path)
+                    break
     if not selected:
         return source, []
     final = render(accepted)

@@ -15,6 +15,14 @@ from modern_backend import preserve_multiline_return_shapes, recover
 
 @unittest.skipUnless(sys.version_info[:2] == (3, 14), 'Requires CPython 3.14')
 class SourceLayoutTests(unittest.TestCase):
+    JOINT_SOURCE = '''def work(rows, convert):
+    """Retain shared iterator cleanup after choosing a value."""
+    for row in rows:
+        return (
+            ((convert(row) if row else (0 if True else None)) if True else None) if True else None
+        )
+    return 1
+'''
     SOURCE = '''def work(rows, convert):
     """Select the first eligible row."""
     for row in rows:
@@ -91,6 +99,56 @@ class SourceLayoutTests(unittest.TestCase):
                 self.assertEqual(selected, [])
                 self.assertEqual(fixed, changed)
                 self.assertFalse(compare(reference, compile_source(fixed, 'owned-rejected'))['all_units_match'])
+
+    def check_joint_behavior(self, candidate):
+        for rows in ([], [0], [2], [-3], [None], [None, 2], [2, 3]):
+            for failure in ('', 'type', 'value', 'other'):
+                with self.subTest(rows=rows, failure=failure):
+                    self.assertEqual(self.exercise(self.JOINT_SOURCE, rows, failure),
+                                     self.exercise(candidate, rows, failure))
+
+    def test_asymmetric_join_retains_the_for_only_shared_cleanup(self):
+        reference = compile_source(self.JOINT_SOURCE, 'owned-original')
+        tree = ast.parse(self.JOINT_SOURCE)
+        returned = tree.body[0].body[1].body[0]
+        returned.value = returned.value.body.body
+        returned.value.orelse = returned.value.orelse.body
+        dense = ast.unparse(ast.fix_missing_locations(tree)) + '\n'
+        self.assertFalse(compare(reference, compile_source(dense, 'owned-dense'))['all_units_match'])
+        fixed, selected = preserve_multiline_return_shapes(dense, reference, None)
+        self.assertEqual(selected, ['<module>/work#1'])
+        self.assertTrue(compare(reference, compile_source(fixed, 'owned-fixed'))['all_units_match'])
+        self.assertEqual(preserve_multiline_return_shapes(fixed, reference, None), (fixed, []))
+        self.check_joint_behavior(fixed)
+
+    def test_asymmetric_join_does_not_accept_different_work_or_results(self):
+        reference = compile_source(self.JOINT_SOURCE, 'owned-original')
+        dense = ast.unparse(ast.parse(self.JOINT_SOURCE)) + '\n'
+        for changed in (dense.replace('convert(row)', 'convert(row) + 1'),
+                        dense.replace('0 if True else None', '1 if True else None'),
+                        dense.replace('if row else', 'if not row else')):
+            with self.subTest(source=changed):
+                fixed, selected = preserve_multiline_return_shapes(changed, reference, None)
+                self.assertEqual(selected, [])
+                self.assertEqual(fixed, changed)
+                self.assertFalse(compare(reference, compile_source(fixed, 'owned-negative'))['all_units_match'])
+
+    @unittest.skipUnless(os.environ.get('PYARMOR_MODERN_BACKEND'),
+                         'Set PYARMOR_MODERN_BACKEND for the complete pipeline')
+    def test_asymmetric_join_survives_the_complete_source_pipeline(self):
+        reference = compile_source(self.JOINT_SOURCE, 'owned-original')
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory) / 'joint.1shot'
+            Path(str(prefix) + '.recovered.pyc').write_bytes(
+                importlib.util.MAGIC_NUMBER + bytes(12) + marshal.dumps(reference))
+            sequence = Path(str(prefix) + '.seq')
+            sequence.write_bytes(b'\xa1' + bytes(16) + b'\xa2' + bytes(12) + b'\xf0\xff\x00\x00')
+            report = recover(sequence, Path(os.environ['PYARMOR_MODERN_BACKEND']).resolve())
+            self.assertTrue(report['syntax_valid'], report)
+            source = Path(str(prefix) + '.cdc.py').read_text()
+            self.assertTrue(compare(reference, compile_source(source, 'owned-joint-pipeline'))['all_units_match'])
+            self.assertEqual(report['verified_multiline_return_shapes'], ['<module>/work#1'])
+            self.check_joint_behavior(source)
 
     def test_decorated_owner_descendants_and_neighbors_are_retained(self):
         source = '''def keep(function):
