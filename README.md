@@ -579,4 +579,8 @@ ordinary reader trees prove exact instructions and exception tables; 396
 paired scenarios check query/context lifetime, parsing/building, failures,
 cancellation and suppression. All 211 unpacker cases pass with one existing
 expected failure. The corrected original reader again proves all 68 units.
-Stable promotion still requires the new complete frozen corpus retention gate.
+The complete frozen 274-module retention gate now passes: fifteen raw native
+gains, zero raw/composite losses, and every previous complete module retained.
+Raw generic coverage reaches 13,925/14,291 with 137 complete candidates. The
+frozen source overlay stays at 14,242/246 because existing source owners cover
+these gains already. All 274 sources compile; comparator rules are unchanged.
