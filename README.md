@@ -584,3 +584,22 @@ gains, zero raw/composite losses, and every previous complete module retained.
 Raw generic coverage reaches 13,925/14,291 with 137 complete candidates. The
 frozen source overlay stays at 14,242/246 because existing source owners cover
 these gains already. All 274 sources compile; comparator rules are unchanged.
+
+Version 0.4.35 development adds a bounded source rendering pass after the
+existing AST repairs. CPython 3.14's small-exit-block optimizer counts a
+return-location NOP before removing padding. Keeping an existing return
+expression on a separate line can therefore preserve a shared return block,
+even though the AST and executed expression are unchanged. An explanatory
+comment inside the parentheses preserves the required layout under Black.
+The pass also tries the existing displaced Try-tail reconstruction together
+with that rendering, since neither repair alone always passes verification.
+
+Every acceptance proves the complete owner and its descendants, then retains
+all earlier module matches. Trials are bounded to existing returns and error
+scopes; changed work, values and handlers are rejected. Five owned tests cover
+same-AST formatting, coupled scope repair, decorated owners and descendants,
+negative controls, and the complete export/source pipeline. They compare 96
+paired behavior cases plus five decorated-owner cases. All 216 unpacker cases
+pass with one existing expected failure. Native 0.6.30 remains pinned, original
+exports and comparator rules are unchanged, and a fresh full-corpus retention
+gate is required before promotion to main.

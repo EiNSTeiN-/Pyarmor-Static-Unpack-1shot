@@ -2582,6 +2582,176 @@ def preserve_shared_branch_returns(tree, reference, decoder):
     return tree, sorted(selected)
 
 
+def _format_multiline_return_shapes(source, reference, decoder):
+    """Prove line-sensitive return rendering without changing business work.
+
+    CPython's small-block inliner counts a return-location NOP before later
+    padding cleanup. Put an existing expression on the next line, optionally
+    with the established bounded constant-True folds. The explanatory comment
+    keeps that line boundary stable under source formatters. Accept only a
+    complete owner/descendant proof and retain every earlier module match.
+    """
+    try:
+        from .bytecode_fidelity import compare, compile_source, units
+    except ImportError:
+        from bytecode_fidelity import compare, compile_source, units
+
+    def checked(text):
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', SyntaxWarning)
+            code = compile_source(text, '<multiline-return-candidate>')
+        matches = {entry['unit'] for entry in compare(reference, code, decoder)['entries']
+                   if entry['matched']}
+        return dict(units(code)), matches
+
+    candidates, before = checked(source)
+    references = dict(units(normalize_code(reference)))
+    tree = ast.parse(source)
+    definitions = defaultdict(list)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            line = node.decorator_list[0].lineno if node.decorator_list else node.lineno
+            definitions[node.name, line].append(node)
+    eligible = []
+    for path, code in candidates.items():
+        owners = definitions[code.co_name, code.co_firstlineno]
+        if path in before or path not in references or len(owners) != 1:
+            continue
+        statements = [node for node in _function_nodes(owners[0])
+                      if isinstance(node, ast.Return) and node.value is not None
+                      and node.lineno == node.end_lineno
+                      and node.value.lineno == node.lineno]
+        if statements:
+            # Keep trials bounded. Try each of the first four relevant returns
+            # and their coupled rendering; don't enumerate arbitrary subsets.
+            statements.sort(key=lambda node: (not isinstance(node.value, ast.IfExp), node.lineno))
+            eligible.append((path, statements[:4]))
+
+    accepted = {}
+
+    def render(edits):
+        lines = source.splitlines()
+        for line_number, (statement, depth) in sorted(edits.items(), reverse=True):
+            line = lines[line_number - 1]
+            indent = line[:len(line) - len(line.lstrip())]
+            if line.lstrip()[:7] != 'return ':
+                raise ValueError('Return statement must own its complete source line')
+            expression = ast.get_source_segment(source, statement.value)
+            for _ in range(depth):
+                expression = '(' + expression + ') if True else None'
+            lines[line_number - 1:line_number] = [
+                indent + 'return (',
+                indent + '    # Keep this line boundary for the verified shared return block.',
+                indent + '    ' + expression,
+                indent + ')',
+            ]
+        return '\n'.join(lines) + '\n'
+
+    selected = []
+    for path, statements in eligible:
+        groups = [[statement] for statement in statements]
+        if len(statements) > 1:
+            groups.append(statements)
+        found = False
+        for depth in range(4):
+            for group in groups:
+                edits = dict(accepted)
+                edits.update({statement.lineno: (statement, depth) for statement in group})
+                try:
+                    trial_source = render(edits)
+                    trial_codes, after = checked(trial_source)
+                    proof = compare(references[path], trial_codes[path], decoder)
+                except (SyntaxError, ValueError, KeyError):
+                    continue
+                if proof['all_units_match'] and (before | set(selected)).issubset(after):
+                    accepted = edits
+                    selected.append(path)
+                    found = True
+                    break
+            if found:
+                break
+    if not selected:
+        return source, []
+    final = render(accepted)
+    _, after = checked(final)
+    if not (before | set(selected)).issubset(after):
+        return source, []
+    return final, sorted(selected)
+
+
+def preserve_multiline_return_shapes(source, reference, decoder):
+    """Couple the proved rendering with an existing displaced Try-tail return."""
+    try:
+        from .bytecode_fidelity import compare, compile_source, units
+    except ImportError:
+        from bytecode_fidelity import compare, compile_source, units
+
+    plain, selected = _format_multiline_return_shapes(source, reference, decoder)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', SyntaxWarning)
+        baseline = compile_source(plain, '<multiline-return-baseline>')
+    before = {entry['unit'] for entry in compare(reference, baseline, decoder)['entries']
+              if entry['matched']}
+    references = dict(units(normalize_code(reference)))
+    tree = ast.parse(plain)
+    definitions = defaultdict(list)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            line = node.decorator_list[0].lineno if node.decorator_list else node.lineno
+            definitions[node.name, line].append(node)
+    changes = {}
+    for path, code in units(baseline):
+        owners = definitions[code.co_name, code.co_firstlineno]
+        if path in before or path not in references or len(owners) != 1:
+            continue
+        edits = []
+        for _, _, suite in _statement_suites(owners[0]):
+            for index in range(len(suite) - 2, -1, -1):
+                region, statement = suite[index:index + 2]
+                if (isinstance(region, ast.Try) and region.handlers
+                        and not region.orelse and not region.finalbody
+                        and isinstance(statement, ast.Return)):
+                    original_body = region.body
+                    region.body = [node for node in original_body if not isinstance(node, ast.Pass)] + [statement]
+                    suite.pop(index + 1)
+                    edits.append((region, original_body, suite, index + 1, statement))
+                    if len(edits) >= 3:
+                        break
+            if len(edits) >= 3:
+                break
+        if edits:
+            changes[path] = edits
+    if not changes:
+        return plain, selected
+
+    def undo(edits):
+        for region, body, suite, index, statement in reversed(edits):
+            region.body = body
+            suite.insert(index, statement)
+
+    trial, _ = _format_multiline_return_shapes(ast.unparse(ast.fix_missing_locations(tree)) + '\n', reference, decoder)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', SyntaxWarning)
+        codes = dict(units(compile_source(trial, '<multiline-try-return>')))
+    chosen = []
+    for path, edits in changes.items():
+        if path in codes and compare(references[path], codes[path], decoder)['all_units_match']:
+            chosen.append(path)
+        else:
+            undo(edits)
+    if not chosen:
+        return plain, selected
+    final, extra = _format_multiline_return_shapes(ast.unparse(ast.fix_missing_locations(tree)) + '\n', reference, decoder)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', SyntaxWarning)
+        compiled = compile_source(final, '<multiline-final-return>')
+    after = {entry['unit'] for entry in compare(reference, compiled, decoder)['entries']
+             if entry['matched']}
+    if not (before | set(chosen)).issubset(after):
+        return plain, selected
+    return final, sorted(set(selected) | set(chosen) | set(extra))
+
+
 def recover(sequence: Path, backend: Path) -> dict:
     """Use the native export beside sequence and write validated source + status."""
     prefix = Path(str(sequence).removesuffix('.seq'))
@@ -2639,6 +2809,8 @@ def recover(sequence: Path, backend: Path) -> dict:
         tree, report['verified_physical_local_slots'] = restore_physical_local_slots(tree, code, transformer)
         tree, report['verified_displaced_context_results'] = restore_displaced_context_results(tree, code, transformer)
         source = ast.unparse(tree) + '\n'
+        source, report['verified_multiline_return_shapes'] = preserve_multiline_return_shapes(
+            source, code, transformer)
         if report['verified_shared_return_shapes']:
             lines = []
             for line in source.splitlines():
