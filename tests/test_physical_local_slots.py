@@ -85,10 +85,11 @@ class PhysicalLocalSlots(unittest.TestCase):
             self.source(marker=False).replace("cost = row.get('cost')",
                 "try:\n            cost = row.get('cost')\n        except ValueError:\n            return 0"),
             self.source(marker=False).replace('    for row in rows:',
-                '    if False:\n        invented = None\n    for row in rows:'),
+                '    if False:\n        first_extra = None\n        second_extra = None\n    for row in rows:'),
         ]
-        # An extra ordinary local is significant even if its declaration is
-        # dead; only the original hidden marker has the canonical exception.
+        # Adding more slots than the original reservation remains significant,
+        # even when their declarations are dead. A one-for-one unused rename
+        # is covered separately as permitted internal-name variance.
         for candidate in candidates:
             reference, code, tree, selected = self.restore(original, candidate)
             self.assertFalse(selected)

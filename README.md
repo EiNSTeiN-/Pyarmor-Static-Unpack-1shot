@@ -641,3 +641,20 @@ three targeted raw modules. The component's selected suite passes206 methods.
 Feature CI passes219 unpacker cases (218passes, one existing expected failure).
 Version .36 is promoted after this full gate; no exception or instruction
 comparison rule is broadened.
+
+Version 0.4.37 development permits a neutral internal name for an existing,
+unused PyArmor local reservation. Removing that slot can move ordinary locals
+across CPython 3.14's 64-slot load boundary and change real instructions. The
+candidate must retain the original slot position, total local count and public
+parameter names; no instruction, fused local access or closure may use the
+renamed reservation. Only its internal naming ordinal is aligned. Operations,
+values, branches, interfaces and exception coverage are still compared.
+
+Six new owned regressions cover byte-identical neutral renames, changed loads
+after slot deletion, live/captured slots, fused accesses, public keyword names,
+and altered work or handlers. All 225 unpacker cases pass with one existing
+expected failure. The source-generation algorithm and native 0.6.30 remain
+unchanged from .36. A frozen full raw/composite retention gate is required
+before promotion; generation can be reused because no generation algorithm
+changed. The seventeen coroutine exception gaps and terminal rethrow mismatch
+remain strict failures.

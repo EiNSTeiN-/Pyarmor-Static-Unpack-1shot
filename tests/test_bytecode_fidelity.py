@@ -7,12 +7,87 @@ import types
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'oneshot'))
-from bytecode_fidelity import compare, compile_source, constant
+from bytecode_fidelity import compare, compile_source, constant, unused_protection_slot_aliases
 from modern_backend import MarkerNormalizer, _varint, unused_future_annotation_offsets
 
 
 @unittest.skipUnless(sys.version_info[:2] == (3, 14), 'Requires CPython 3.14')
 class FidelityTests(unittest.TestCase):
+    def reservation_source(self, name='__assert_armored__'):
+        declarations = ''.join(f'    value_{index} = {index}\n' for index in range(61))
+        return (f'def choose(flag, convert):\n    if False:\n        {name} = None\n'
+                + declarations
+                + '    try:\n        if flag:\n            edge = convert(3)\n'
+                  '        else:\n            edge = convert(4)\n'
+                  '        return edge\n    except UnboundLocalError:\n        return "missing"\n')
+
+    def reservation_code(self, source):
+        module = compile_source(source, 'owned-reservation.py')
+        return next(value for value in module.co_consts if isinstance(value, types.CodeType))
+
+    def test_unused_protection_slot_can_use_a_neutral_name_without_changing_bytes(self):
+        source = self.reservation_source()
+        original = self.reservation_code(source)
+        for name in ('unused_layout_slot', 'compiled_slot_reservation', 'not_a_magic_spelling'):
+            recovered = self.reservation_code(self.reservation_source(name))
+            self.assertEqual(original.co_code, recovered.co_code)
+            self.assertEqual(original.co_exceptiontable, recovered.co_exceptiontable)
+            self.assertEqual(unused_protection_slot_aliases(original, recovered), (2,))
+            self.assertTrue(compare(original, recovered)['all_units_match'])
+            for flag in (False, True, 0, 1, None):
+                self.assertEqual(types.FunctionType(original, {})(flag, int),
+                                 types.FunctionType(recovered, {})(flag, int))
+
+    def test_removing_the_physical_slot_still_rejects_changed_load_instructions(self):
+        source = self.reservation_source()
+        original = self.reservation_code(source)
+        deleted = self.reservation_code(source.replace('    if False:\n        __assert_armored__ = None\n', ''))
+        self.assertEqual(original.co_varnames.index('edge'), 64)
+        self.assertEqual(deleted.co_varnames.index('edge'), 63)
+        self.assertNotEqual(original.co_code, deleted.co_code)
+        self.assertEqual(unused_protection_slot_aliases(original, deleted), ())
+        self.assertFalse(compare(original, deleted)['all_units_match'])
+
+    def test_a_live_or_captured_source_slot_cannot_be_ignored_as_a_reservation(self):
+        original = self.reservation_code(self.reservation_source())
+        neutral = self.reservation_source('unused_layout_slot')
+        for changed in (neutral.replace('    try:\n', '    unused_layout_slot = 7\n    try:\n'),
+                        neutral.replace('    try:\n', '    seen = unused_layout_slot\n    try:\n'),
+                        neutral.replace('    try:\n', '    def read():\n        return unused_layout_slot\n    try:\n')):
+            candidate = self.reservation_code(changed)
+            self.assertEqual(unused_protection_slot_aliases(original, candidate), ())
+            self.assertFalse(compare(original, candidate)['all_units_match'])
+
+    def test_reservation_name_handling_does_not_allow_changed_values_calls_or_handlers(self):
+        original = self.reservation_code(self.reservation_source())
+        neutral = self.reservation_source('unused_layout_slot')
+        for changed in (neutral.replace('convert(3)', 'convert(4)'),
+                        neutral.replace('convert(3)', 'other(3)'),
+                        neutral.replace('except UnboundLocalError', 'except ValueError'),
+                        neutral.replace('return edge', 'return -edge')):
+            self.assertFalse(compare(original, self.reservation_code(changed))['all_units_match'])
+
+    def test_keyword_parameters_never_become_ignored_reservation_aliases(self):
+        original = self.reservation_code('def choose(__assert_armored__):\n    return __assert_armored__\n')
+        candidate = self.reservation_code('def choose(unused_layout_slot):\n    return unused_layout_slot\n')
+        self.assertEqual(unused_protection_slot_aliases(original, candidate), ())
+        self.assertFalse(compare(original, candidate)['all_units_match'])
+
+    def test_fused_fast_slot_accesses_disable_reservation_aliasing(self):
+        original = self.reservation_code(
+            'def choose(flag):\n    if False:\n        __assert_armored__ = None\n'
+            '    first = 1\n    second = 2\n    return first + second\n')
+        candidate = self.reservation_code(
+            'def choose(flag):\n    if False:\n        unused_layout_slot = None\n'
+            '    unused_layout_slot = 3\n'
+            '    first = 1\n    second = 2\n    return unused_layout_slot + first\n')
+        fused = [operation for operation in dis.get_instructions(candidate)
+                 if operation.opname == 'LOAD_FAST_LOAD_FAST']
+        self.assertTrue(fused)
+        self.assertIn(1, (fused[0].arg >> 4, fused[0].arg & 15))
+        self.assertEqual(unused_protection_slot_aliases(original, candidate), ())
+        self.assertFalse(compare(original, candidate)['all_units_match'])
+
     def test_coupled_identity_and_truth_jump_inversion_preserves_the_predicate(self):
         code = next(value for value in compile_source(
             'def select(value):\n    if value is True:\n        return 7\n    return 3\n',

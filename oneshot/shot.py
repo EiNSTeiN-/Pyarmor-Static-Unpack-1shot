@@ -28,7 +28,7 @@ from runtime import RuntimeInfo
 from util import dword, bytes_sub
 
 
-__version__ = "0.4.36-einstein.1"
+__version__ = "0.4.37-einstein.1"
 
 
 # Initialize colorama

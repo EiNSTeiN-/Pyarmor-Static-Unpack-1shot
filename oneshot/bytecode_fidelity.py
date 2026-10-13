@@ -59,10 +59,11 @@ def constant(value):
     return (type(value).__name__, repr(value))
 
 
-def local_operand(code, index):
+def local_operand(code, index, reserved_local_indices=()):
     """Alpha-rename internal slots while preserving keyword parameter names."""
     name = code._varname_from_oparg(index)
-    locals_ = [value for value in code.co_varnames if value != '__assert_armored__']
+    locals_ = [value for slot, value in enumerate(code.co_varnames)
+               if value != '__assert_armored__' and slot not in reserved_local_indices]
     parameters = code.co_argcount + code.co_kwonlyargcount
     parameters += bool(code.co_flags & 4) + bool(code.co_flags & 8)
     if name in code.co_varnames[:parameters]:
@@ -77,6 +78,51 @@ def local_operand(code, index):
     return ('unresolved_slot', index)
 
 
+def unused_protection_slot_aliases(reference, candidate):
+    """Recognize renamed, unreferenced reservation slots at the same position.
+
+    The protected name already has no canonical local ordinal. Its source
+    counterpart may use a neutral name, but it must retain the physical slot
+    and cannot contain any instruction or closure that accesses that slot.
+    No operation, branch, value or exception region is removed by this check.
+    """
+    if '__assert_armored__' not in reference.co_varnames:
+        return ()
+    if len(reference.co_varnames) != len(candidate.co_varnames):
+        return ()
+    parameters = reference.co_argcount + reference.co_kwonlyargcount
+    parameters += bool(reference.co_flags & 4) + bool(reference.co_flags & 8)
+    candidate_parameters = candidate.co_argcount + candidate.co_kwonlyargcount
+    candidate_parameters += bool(candidate.co_flags & 4) + bool(candidate.co_flags & 8)
+    if parameters != candidate_parameters or reference.co_varnames[:parameters] != candidate.co_varnames[:parameters]:
+        return ()
+    if len(set(candidate.co_varnames)) != len(candidate.co_varnames):
+        return ()
+    result = []
+    operations = tuple(dis.get_instructions(candidate))
+    for slot, name in enumerate(reference.co_varnames):
+        if name != '__assert_armored__' or slot < parameters or name in reference.co_cellvars:
+            continue
+        alias = candidate.co_varnames[slot]
+        if alias == name or alias in candidate.co_cellvars or alias in candidate.co_freevars:
+            continue
+        if '__assert_armored__' in candidate.co_varnames:
+            continue
+        accessed = False
+        for operation in operations:
+            if operation.opname in FUSED:
+                touched = (operation.arg >> 4, operation.arg & 15)
+                if slot in touched:
+                    accessed = True
+                    break
+            elif operation.argval == alias:
+                accessed = True
+                break
+        if not accessed:
+            result.append(slot)
+    return tuple(result)
+
+
 @dataclass(frozen=True)
 class CanonicalCode:
     signature: tuple
@@ -85,7 +131,7 @@ class CanonicalCode:
     unresolved: tuple
 
 
-def canonical(code, decoder=None):
+def canonical(code, decoder=None, reserved_local_indices=()):
     """Apply an explicit, narrow whitelist; keep control flow and handlers."""
     original = [item for item in dis.get_instructions(code) if item.opname not in PADDING]
     removed, replacements, unresolved = set(), {}, []
@@ -116,7 +162,7 @@ def canonical(code, decoder=None):
 
     def store(item):
         if item.opname == 'STORE_FAST':
-            return (item.opname, local_operand(code, item.arg))
+            return (item.opname, local_operand(code, item.arg, reserved_local_indices))
         if item.opname in ('STORE_NAME', 'STORE_GLOBAL'):
             return (item.opname, item.argval)
         return None
@@ -208,7 +254,7 @@ def canonical(code, decoder=None):
         if name in FUSED:
             for opname, slot in zip(FUSED[name], (arg >> 4, arg & 15)):
                 offsets.append(item.offset)
-                ops.append((opname, local_operand(code, slot)))
+                ops.append((opname, local_operand(code, slot, reserved_local_indices)))
             continue
         offsets.append(item.offset)
         if name == 'LOAD_FAST_BORROW':
@@ -220,7 +266,7 @@ def canonical(code, decoder=None):
         elif name in ('LOAD_FAST', 'LOAD_FAST_CHECK', 'LOAD_FAST_AND_CLEAR', 'STORE_FAST',
                       'DELETE_FAST', 'LOAD_DEREF', 'STORE_DEREF', 'DELETE_DEREF',
                       'LOAD_CLOSURE', 'MAKE_CELL'):
-            operand = local_operand(code, arg)
+            operand = local_operand(code, arg, reserved_local_indices)
         elif item.opcode in dis.hasjump:
             # Direction is determined by the target; NO_INTERRUPT stays distinct.
             if name in ('JUMP_FORWARD', 'JUMP_BACKWARD'):
@@ -320,7 +366,9 @@ def compare(reference, candidate, decoder=None):
         if path not in expected or path not in actual:
             entry['reason'] = 'missing_reference_unit' if path not in expected else 'missing_source_unit'
         else:
-            left, right = canonical(expected[path], decoder), canonical(actual[path])
+            reserved = unused_protection_slot_aliases(expected[path], actual[path])
+            left = canonical(expected[path], decoder)
+            right = canonical(actual[path], decoder, reserved)
             if left.unresolved or right.unresolved:
                 entry.update(reason='unsupported_marker_pattern', unresolved_marker_count=len(left.unresolved) + len(right.unresolved))
             elif left.signature != right.signature:
