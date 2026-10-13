@@ -613,7 +613,7 @@ exports and comparison rules are unchanged, and feature CI passes216 cases
 with the existing expected failure. Version .35 is promoted after this gate;
 later manual source and readability gains are counted separately.
 
-Version 0.4.36 development adds one directed asymmetric return join. For a
+Version 0.4.36 adds one directed asymmetric return join. For a
 For-only conditional return, the normal unwind has three meaningful operations;
 the multiline return adds only one location NOP, still within CPython's copy
 limit. Folding the existing false arm once and the whole expression twice,
@@ -628,5 +628,16 @@ recovery, and reject changed conversion, false result and branch conditions.
 All219 suite cases pass with one existing expected failure. Three protected
 raw owner trees independently gain one match each without losses: both JSON
 count readers and the timestamp adapter. Their other incomplete raw neighbors
-remain unclaimed. Native0.6.30 and comparator rules stay unchanged; full-corpus
-retention remains required before .36 promotion.
+remain unclaimed. Native0.6.30 and comparator rules stay unchanged.
+
+The fresh complete .36 pipeline regenerates all274 protected sources in1899.8
+seconds, with no API-generation reuse and unchanged exports. Strict raw
+retention proves **13,929/14,291 units /138 complete raw modules**: three gains,
+zero losses. The frozen106-module source overlay proves **14,273/14,291
+/263 complete candidates**, likewise three gains and zero losses. All274 sources
+compile; seventeen coroutine exception gaps and one terminal-layout mismatch
+remain strict failures. Black formatting retains all old and new matches in the
+three targeted raw modules. The component's selected suite passes206 methods.
+Feature CI passes219 unpacker cases (218passes, one existing expected failure).
+Version .36 is promoted after this full gate; no exception or instruction
+comparison rule is broadened.
