@@ -511,5 +511,19 @@ separate, and the final module gate protects all previous matches.
 Eight owned methods test these repairs and negative controls. All 200 unpacker
 cases pass locally with one existing expected failure. The workflow pins
 native 0.6.22, whose full 274-module corpus gate gains 11 raw/10 composite
-units with zero losses. Development 0.4.29 still requires its own full corpus
-retention audit before promotion. No comparison rule is relaxed.
+units with zero losses. The completed 0.4.29 corpus audit adds 39 raw/composite
+matches and loses zero; all 274 sources compile. No comparison rule is relaxed.
+
+Version 0.4.30 development restores an original unused armor local only where
+removing it moves a real local from physical slot 64 to 63 and changes checked
+loads. A dead `if False` declaration reserves that compiler slot without any
+armor call, key or runtime operation. The original marker must be present in
+the reference and absent from the candidate, their local counts must differ
+by exactly one, and checked-load evidence must identify the crossed boundary.
+At most eight existing statement boundaries are tried after the docstring.
+Full owner/descendant instructions and exception tables, plus all previously
+matched neighbors, decide acceptance. Already matched and nearby slot layouts
+remain untouched. Five owned methods and one full export-pipeline method test
+the boundary, ordinary behavior, retained docstrings/children and rejection of
+changed work, handlers or invented locals. The application corpus gate remains
+required before promotion. The workflow pins proved native 0.6.24.

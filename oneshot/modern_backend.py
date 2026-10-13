@@ -1576,6 +1576,47 @@ def restore_payload_and_handler_shapes(tree, reference, decoder):
     return _prove_function_trials(tree, reference, decoder, trials)
 
 
+def restore_physical_local_slots(tree, reference, decoder):
+    """Reserve an original dead marker slot only when checked loads require it.
+
+    CPython's definite-assignment analysis changes at physical slot 64. Removing
+    the unused armor local can move a real local across that boundary, despite
+    unchanged canonical local roles. No runtime armor operation is restored.
+    Bounded dead declarations qualify only through complete owner/descendant
+    instruction and exception proof and the existing module-retention gate.
+    """
+    marker = '__assert_armored__'
+
+    def trials(owner, original, candidate):
+        parameters = original.co_argcount + original.co_kwonlyargcount
+        parameters += bool(original.co_flags & 4) + bool(original.co_flags & 8)
+        if (marker not in original.co_varnames[parameters:]
+                or marker in candidate.co_varnames
+                or original.co_nlocals != candidate.co_nlocals + 1
+                or original.co_nlocals < 65):
+            return
+        marker_slot = original.co_varnames.index(marker)
+        checked = {item.argval for item in dis.get_instructions(original)
+                   if item.opname == 'LOAD_FAST_CHECK' and item.arg >= 64
+                   and marker_slot < item.arg}
+        shifted = {item.argval for item in dis.get_instructions(candidate)
+                   if item.opname in ('LOAD_FAST', 'LOAD_FAST_BORROW')
+                   and item.arg == 63}
+        if not checked.intersection(shifted):
+            return
+        start = bool(owner.body and isinstance(owner.body[0], ast.Expr)
+                     and isinstance(owner.body[0].value, ast.Constant)
+                     and isinstance(owner.body[0].value.value, str))
+        for index in range(start, min(len(owner.body) + 1, start + 8)):
+            body = copy.deepcopy(owner.body)
+            declaration = ast.If(ast.Constant(False),
+                [ast.Assign([ast.Name(marker, ast.Store())], ast.Constant(None))], [])
+            body.insert(index, declaration)
+            yield f'original-dead-marker-slot-before-statement-{index}', body
+
+    return _prove_function_trials(tree, reference, decoder, trials)
+
+
 def restore_substantive_value_shapes(tree, reference, decoder):
     """Recover existing operands and bindings only with full subtree proof.
 
@@ -2526,6 +2567,7 @@ def recover(sequence: Path, backend: Path) -> dict:
         tree, report['verified_substantive_value_shapes'] = restore_substantive_value_shapes(tree, code, transformer)
         tree, report['verified_shared_guard_shapes'] = restore_shared_guard_shapes(tree, code, transformer)
         tree, report['verified_payload_and_handler_shapes'] = restore_payload_and_handler_shapes(tree, code, transformer)
+        tree, report['verified_physical_local_slots'] = restore_physical_local_slots(tree, code, transformer)
         source = ast.unparse(tree) + '\n'
         if report['verified_shared_return_shapes']:
             lines = []

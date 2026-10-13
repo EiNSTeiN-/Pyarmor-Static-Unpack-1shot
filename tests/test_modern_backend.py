@@ -23,6 +23,23 @@ BACKEND = os.environ.get('PYARMOR_MODERN_BACKEND')
 @unittest.skipUnless(BACKEND and sys.version_info[:2] == (3, 14),
                      'Set PYARMOR_MODERN_BACKEND and use CPython 3.14')
 class ModernBackendTests(native.Python314Tests):
+    def test_original_dead_marker_slot_survives_full_export_pipeline(self):
+        from bytecode_fidelity import compare, compile_source
+        source = ('def work(rows):\n'
+                  '    """Select the first valid cost."""\n'
+                  '    if False:\n        __assert_armored__ = None\n')
+        source += ''.join(f'    local_{index} = None\n' for index in range(61))
+        source += ("    for row in rows:\n        cost = row.get('cost')\n"
+                   '        if cost is not None:\n            return cost\n'
+                   '    return None\n')
+        original, reconstructed = self.recover(source)
+        self.assertTrue(compare(compile_source(source, 'original'),
+                                compile_source(self.last_generated, 'reconstructed'))['all_units_match'])
+        self.assertIn('if False:\n        __assert_armored__ = None', self.last_generated)
+        self.assertEqual(reconstructed['work'].__doc__, original['work'].__doc__)
+        for rows in ([], [{}], [{'cost': None}], [{'cost': 0}], [{}, {'cost': 8}]):
+            self.assertEqual(original['work'](rows), reconstructed['work'](rows))
+
     def recover(self, source):
         return self.recover_code(compile(source, 'fixture.py', 'exec', dont_inherit=True))
 
